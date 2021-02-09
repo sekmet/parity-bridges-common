@@ -21,7 +21,7 @@
 //! It has a simple interface for achieving this. First it can import headers to the runtime
 //! storage. During this it will check the validity of the headers and ensure they don't conflict
 //! with any existing headers (e.g they're on a different finalized chain). Secondly it can finalize
-//! an already imported header (and its ancestors) given a valid Grandpa justification.
+//! an already imported header (and its ancestors) given a valid GRANDPA justification.
 //!
 //! With these two functions the pallet is able to form a "source of truth" for what headers have
 //! been finalized on a given Substrate chain. This can be a useful source of info for other
@@ -32,6 +32,7 @@
 #![allow(clippy::large_enum_variant)]
 
 use crate::storage::ImportedHeader;
+use bp_header_chain::AuthoritySet;
 use bp_runtime::{BlockNumberOf, Chain, HashOf, HasherOf, HeaderOf};
 use frame_support::{
 	decl_error, decl_module, decl_storage, dispatch::DispatchResult, ensure, traits::Get, weights::DispatchClass,
@@ -43,12 +44,10 @@ use sp_std::{marker::PhantomData, prelude::*};
 use sp_trie::StorageProof;
 
 // Re-export since the node uses these when configuring genesis
-pub use storage::{AuthoritySet, InitializationData, ScheduledChange};
+pub use storage::{InitializationData, ScheduledChange};
 
-pub use justification::decode_justification_target;
 pub use storage_proof::StorageProofChecker;
 
-mod justification;
 mod storage;
 mod storage_proof;
 mod verifier;
@@ -60,13 +59,13 @@ mod mock;
 mod fork_tests;
 
 /// Block number of the bridged chain.
-pub(crate) type BridgedBlockNumber<T> = BlockNumberOf<<T as Trait>::BridgedChain>;
+pub(crate) type BridgedBlockNumber<T> = BlockNumberOf<<T as Config>::BridgedChain>;
 /// Block hash of the bridged chain.
-pub(crate) type BridgedBlockHash<T> = HashOf<<T as Trait>::BridgedChain>;
+pub(crate) type BridgedBlockHash<T> = HashOf<<T as Config>::BridgedChain>;
 /// Hasher of the bridged chain.
-pub(crate) type BridgedBlockHasher<T> = HasherOf<<T as Trait>::BridgedChain>;
+pub(crate) type BridgedBlockHasher<T> = HasherOf<<T as Config>::BridgedChain>;
 /// Header of the bridged chain.
-pub(crate) type BridgedHeader<T> = HeaderOf<<T as Trait>::BridgedChain>;
+pub(crate) type BridgedHeader<T> = HeaderOf<<T as Config>::BridgedChain>;
 
 /// A convenience type identifying headers.
 #[derive(RuntimeDebug, PartialEq)]
@@ -77,13 +76,15 @@ pub struct HeaderId<H: HeaderT> {
 	pub hash: H::Hash,
 }
 
-pub trait Trait: frame_system::Trait {
+pub trait Config: frame_system::Config {
 	/// Chain that we are bridging here.
 	type BridgedChain: Chain;
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as SubstrateBridge {
+	trait Store for Module<T: Config> as SubstrateBridge {
+		/// Hash of the header used to bootstrap the pallet.
+		InitialHash: BridgedBlockHash<T>;
 		/// The number of the highest block(s) we know of.
 		BestHeight: BridgedBlockNumber<T>;
 		/// Hash of the header at the highest known height.
@@ -94,17 +95,17 @@ decl_storage! {
 		/// Hash of the best finalized header.
 		BestFinalized: BridgedBlockHash<T>;
 		/// The set of header IDs (number, hash) which enact an authority set change and therefore
-		/// require a Grandpa justification.
+		/// require a GRANDPA justification.
 		RequiresJustification: map hasher(identity) BridgedBlockHash<T> => BridgedBlockNumber<T>;
 		/// Headers which have been imported into the pallet.
 		ImportedHeaders: map hasher(identity) BridgedBlockHash<T> => Option<ImportedHeader<BridgedHeader<T>>>;
-		/// The current Grandpa Authority set.
+		/// The current GRANDPA Authority set.
 		CurrentAuthoritySet: AuthoritySet;
 		/// The next scheduled authority set change for a given fork.
 		///
 		/// The fork is indicated by the header which _signals_ the change (key in the mapping).
 		/// Note that this is different than a header which _enacts_ a change.
-		// Grandpa doesn't require there to always be a pending change. In fact, most of the time
+		// GRANDPA doesn't require there to always be a pending change. In fact, most of the time
 		// there will be no pending change available.
 		NextScheduledChange: map hasher(identity) BridgedBlockHash<T> => Option<ScheduledChange<BridgedBlockNumber<T>>>;
 		/// Optional pallet owner.
@@ -137,7 +138,7 @@ decl_storage! {
 }
 
 decl_error! {
-	pub enum Error for Module<T: Trait> {
+	pub enum Error for Module<T: Config> {
 		/// This header has failed basic verification.
 		InvalidHeader,
 		/// This header has not been finalized.
@@ -152,11 +153,13 @@ decl_error! {
 		Halted,
 		/// The pallet has already been initialized.
 		AlreadyInitialized,
+		/// The given header is not a descendant of a particular header.
+		NotDescendant,
 	}
 }
 
 decl_module! {
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config> for enum Call where origin: T::Origin {
 		type Error = Error<T>;
 
 		/// Import a signed Substrate header into the runtime.
@@ -172,15 +175,21 @@ decl_module! {
 		) -> DispatchResult {
 			ensure_operational::<T>()?;
 			let _ = ensure_signed(origin)?;
-			frame_support::debug::trace!("Got header {:?}", header);
+			let hash = header.hash();
+			frame_support::debug::trace!("Going to import header {:?}: {:?}", hash, header);
 
 			let mut verifier = verifier::Verifier {
 				storage: PalletStorage::<T>::new(),
 			};
 
 			let _ = verifier
-				.import_header(header)
-				.map_err(|_| <Error<T>>::InvalidHeader)?;
+				.import_header(hash, header)
+				.map_err(|e| {
+					frame_support::debug::error!("Failed to import header {:?}: {:?}", hash, e);
+					<Error<T>>::InvalidHeader
+				})?;
+
+			frame_support::debug::trace!("Successfully imported header: {:?}", hash);
 
 			Ok(())
 		}
@@ -199,7 +208,7 @@ decl_module! {
 		) -> DispatchResult {
 			ensure_operational::<T>()?;
 			let _ = ensure_signed(origin)?;
-			frame_support::debug::trace!("Got header hash {:?}", hash);
+			frame_support::debug::trace!("Going to finalize header: {:?}", hash);
 
 			let mut verifier = verifier::Verifier {
 				storage: PalletStorage::<T>::new(),
@@ -207,7 +216,12 @@ decl_module! {
 
 			let _ = verifier
 				.import_finality_proof(hash, finality_proof.into())
-				.map_err(|_| <Error<T>>::UnfinalizedHeader)?;
+				.map_err(|e| {
+					frame_support::debug::error!("Failed to finalize header {:?}: {:?}", hash, e);
+					<Error<T>>::UnfinalizedHeader
+				})?;
+
+			frame_support::debug::trace!("Successfully finalized header: {:?}", hash);
 
 			Ok(())
 		}
@@ -277,7 +291,7 @@ decl_module! {
 	}
 }
 
-impl<T: Trait> Module<T> {
+impl<T: Config> Module<T> {
 	/// Get the highest header(s) that the pallet knows of.
 	pub fn best_headers() -> Vec<(BridgedBlockNumber<T>, BridgedBlockHash<T>)> {
 		PalletStorage::<T>::new()
@@ -352,8 +366,105 @@ impl<T: Trait> Module<T> {
 	}
 }
 
+impl<T: Config> bp_header_chain::HeaderChain<BridgedHeader<T>, sp_runtime::DispatchError> for Module<T> {
+	fn best_finalized() -> BridgedHeader<T> {
+		PalletStorage::<T>::new().best_finalized_header().header
+	}
+
+	fn authority_set() -> AuthoritySet {
+		PalletStorage::<T>::new().current_authority_set()
+	}
+
+	fn append_finalized_chain(
+		headers: impl IntoIterator<Item = BridgedHeader<T>>,
+	) -> Result<(), sp_runtime::DispatchError> {
+		let mut storage = PalletStorage::<T>::new();
+
+		let mut header_iter = headers.into_iter().peekable();
+		let first_header = header_iter.peek().ok_or(Error::<T>::NotDescendant)?;
+
+		// Quick ancestry check to make sure we're not writing complete nonsense to storage
+		ensure!(
+			<BestFinalized<T>>::get() == *first_header.parent_hash(),
+			Error::<T>::NotDescendant,
+		);
+
+		for header in header_iter {
+			import_header_unchecked::<_, T>(&mut storage, header);
+		}
+
+		Ok(())
+	}
+}
+
+/// Import a finalized header without checking if this is true.
+///
+/// This function assumes that all the given header has already been proven to be valid and
+/// finalized. Using this assumption it will write them to storage with minimal checks. That
+/// means it's of great importance that this function *not* called with any headers whose
+/// finality has not been checked, otherwise you risk bricking your bridge.
+///
+/// One thing this function does do for you is GRANDPA authority set handoffs. However, since it
+/// does not do verification on the incoming header it will assume that the authority set change
+/// signals in the digest are well formed.
+fn import_header_unchecked<S, T>(storage: &mut S, header: BridgedHeader<T>)
+where
+	S: BridgeStorage<Header = BridgedHeader<T>>,
+	T: Config,
+{
+	// Since we want to use the existing storage infrastructure we need to indicate the fork
+	// that we're on. We will assume that since we are using the unchecked import there are no
+	// forks, and can indicate that by using the first imported header's "fork".
+	let dummy_fork_hash = <InitialHash<T>>::get();
+
+	// If we have a pending change in storage let's check if the current header enacts it.
+	let enact_change = if let Some(pending_change) = storage.scheduled_set_change(dummy_fork_hash) {
+		pending_change.height == *header.number()
+	} else {
+		// We don't have a scheduled change in storage at the moment. Let's check if the current
+		// header signals an authority set change.
+		if let Some(change) = verifier::find_scheduled_change(&header) {
+			let next_set = AuthoritySet {
+				authorities: change.next_authorities,
+				set_id: storage.current_authority_set().set_id + 1,
+			};
+
+			let height = *header.number() + change.delay;
+			let scheduled_change = ScheduledChange {
+				authority_set: next_set,
+				height,
+			};
+
+			storage.schedule_next_set_change(dummy_fork_hash, scheduled_change);
+
+			// If the delay is 0 this header will enact the change it signaled
+			height == *header.number()
+		} else {
+			false
+		}
+	};
+
+	if enact_change {
+		const ENACT_SET_PROOF: &str = "We only set `enact_change` as `true` if we are sure that there is a scheduled
+				authority set change in storage. Therefore, it must exist.";
+
+		// If we are unable to enact an authority set it means our storage entry for scheduled
+		// changes is missing. Best to crash since this is likely a bug.
+		let _ = storage.enact_authority_set(dummy_fork_hash).expect(ENACT_SET_PROOF);
+	}
+
+	storage.update_best_finalized(header.hash());
+
+	storage.write_header(&ImportedHeader {
+		header,
+		requires_justification: false,
+		is_finalized: true,
+		signal_hash: None,
+	});
+}
+
 /// Ensure that the origin is either root, or `ModuleOwner`.
-fn ensure_owner_or_root<T: Trait>(origin: T::Origin) -> Result<(), BadOrigin> {
+fn ensure_owner_or_root<T: Config>(origin: T::Origin) -> Result<(), BadOrigin> {
 	match origin.into() {
 		Ok(RawOrigin::Root) => Ok(()),
 		Ok(RawOrigin::Signed(ref signer)) if Some(signer) == <Module<T>>::module_owner().as_ref() => Ok(()),
@@ -362,7 +473,7 @@ fn ensure_owner_or_root<T: Trait>(origin: T::Origin) -> Result<(), BadOrigin> {
 }
 
 /// Ensure that the pallet is in operational mode (not halted).
-fn ensure_operational<T: Trait>() -> Result<(), Error<T>> {
+fn ensure_operational<T: Config>() -> Result<(), Error<T>> {
 	if IsHalted::get() {
 		Err(<Error<T>>::Halted)
 	} else {
@@ -370,9 +481,21 @@ fn ensure_operational<T: Trait>() -> Result<(), Error<T>> {
 	}
 }
 
+/// (Re)initialize bridge with given header for using it in external benchmarks.
+#[cfg(feature = "runtime-benchmarks")]
+pub fn initialize_for_benchmarks<T: Config>(header: HeaderOf<T::BridgedChain>) {
+	initialize_bridge::<T>(InitializationData {
+		header,
+		authority_list: Vec::new(), // we don't verify any proofs in external benchmarks
+		set_id: 0,
+		scheduled_change: None,
+		is_halted: false,
+	});
+}
+
 /// Since this writes to storage with no real checks this should only be used in functions that were
 /// called by a trusted origin.
-fn initialize_bridge<T: Trait>(init_params: InitializationData<BridgedHeader<T>>) {
+fn initialize_bridge<T: Config>(init_params: InitializationData<BridgedHeader<T>>) {
 	let InitializationData {
 		header,
 		authority_list,
@@ -394,6 +517,7 @@ fn initialize_bridge<T: Trait>(init_params: InitializationData<BridgedHeader<T>>
 		<NextScheduledChange<T>>::insert(initial_hash, change);
 	};
 
+	<InitialHash<T>>::put(initial_hash);
 	<BestHeight<T>>::put(header.number());
 	<BestHeaders<T>>::put(vec![initial_hash]);
 	<BestFinalized<T>>::put(initial_hash);
@@ -448,10 +572,10 @@ pub trait BridgeStorage {
 	/// Returns None if it is not known to the pallet.
 	fn header_by_hash(&self, hash: <Self::Header as HeaderT>::Hash) -> Option<ImportedHeader<Self::Header>>;
 
-	/// Get the current Grandpa authority set.
+	/// Get the current GRANDPA authority set.
 	fn current_authority_set(&self) -> AuthoritySet;
 
-	/// Update the current Grandpa authority set.
+	/// Update the current GRANDPA authority set.
 	///
 	/// Should only be updated when a scheduled change has been triggered.
 	fn update_current_authority_set(&self, new_set: AuthoritySet);
@@ -459,15 +583,16 @@ pub trait BridgeStorage {
 	/// Replace the current authority set with the next scheduled set.
 	///
 	/// Returns an error if there is no scheduled authority set to enact.
+	#[allow(clippy::result_unit_err)]
 	fn enact_authority_set(&mut self, signal_hash: <Self::Header as HeaderT>::Hash) -> Result<(), ()>;
 
-	/// Get the next scheduled Grandpa authority set change.
+	/// Get the next scheduled GRANDPA authority set change.
 	fn scheduled_set_change(
 		&self,
 		signal_hash: <Self::Header as HeaderT>::Hash,
 	) -> Option<ScheduledChange<<Self::Header as HeaderT>::Number>>;
 
-	/// Schedule a Grandpa authority set change in the future.
+	/// Schedule a GRANDPA authority set change in the future.
 	///
 	/// Takes the hash of the header which scheduled this particular change.
 	fn schedule_next_set_change(
@@ -487,7 +612,7 @@ impl<T> PalletStorage<T> {
 	}
 }
 
-impl<T: Trait> BridgeStorage for PalletStorage<T> {
+impl<T: Config> BridgeStorage for PalletStorage<T> {
 	type Header = BridgedHeader<T>;
 
 	fn write_header(&mut self, header: &ImportedHeader<BridgedHeader<T>>) {
@@ -499,7 +624,12 @@ impl<T: Trait> BridgeStorage for PalletStorage<T> {
 
 		match current_height.cmp(&best_height) {
 			Ordering::Equal => {
-				<BestHeaders<T>>::append(hash);
+				// Want to avoid duplicates in the case where we're writing a finalized header to
+				// storage which also happens to be at the best height the best height
+				let not_duplicate = !<ImportedHeaders<T>>::contains_key(hash);
+				if not_duplicate {
+					<BestHeaders<T>>::append(hash);
+				}
 			}
 			Ordering::Greater => {
 				<BestHeaders<T>>::kill();
@@ -598,51 +728,44 @@ impl<T: Trait> BridgeStorage for PalletStorage<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::mock::helpers::{authority_list, test_header, unfinalized_header};
-	use crate::mock::{run_test, Origin, TestRuntime};
+	use crate::mock::{run_test, test_header, unfinalized_header, Origin, TestHeader, TestRuntime};
+	use bp_header_chain::HeaderChain;
+	use bp_test_utils::{alice, authority_list, bob};
 	use frame_support::{assert_noop, assert_ok};
 	use sp_runtime::DispatchError;
+
+	fn init_with_origin(origin: Origin) -> Result<InitializationData<TestHeader>, DispatchError> {
+		let init_data = InitializationData {
+			header: test_header(1),
+			authority_list: authority_list(),
+			set_id: 1,
+			scheduled_change: None,
+			is_halted: false,
+		};
+
+		Module::<TestRuntime>::initialize(origin, init_data.clone()).map(|_| init_data)
+	}
 
 	#[test]
 	fn init_root_or_owner_origin_can_initialize_pallet() {
 		run_test(|| {
-			let init_data = InitializationData {
-				header: test_header(1),
-				authority_list: authority_list(),
-				set_id: 1,
-				scheduled_change: None,
-				is_halted: false,
-			};
-
-			assert_noop!(
-				Module::<TestRuntime>::initialize(Origin::signed(1), init_data.clone()),
-				DispatchError::BadOrigin,
-			);
-
-			assert_ok!(Module::<TestRuntime>::initialize(Origin::root(), init_data.clone()));
+			assert_noop!(init_with_origin(Origin::signed(1)), DispatchError::BadOrigin);
+			assert_ok!(init_with_origin(Origin::root()));
 
 			// Reset storage so we can initialize the pallet again
 			BestFinalized::<TestRuntime>::kill();
 			ModuleOwner::<TestRuntime>::put(2);
-			assert_ok!(Module::<TestRuntime>::initialize(Origin::signed(2), init_data));
+			assert_ok!(init_with_origin(Origin::signed(2)));
 		})
 	}
 
 	#[test]
 	fn init_storage_entries_are_correctly_initialized() {
 		run_test(|| {
-			let init_data = InitializationData {
-				header: test_header(1),
-				authority_list: authority_list(),
-				set_id: 1,
-				scheduled_change: None,
-				is_halted: false,
-			};
-
 			assert!(Module::<TestRuntime>::best_headers().is_empty());
 			assert_eq!(Module::<TestRuntime>::best_finalized(), test_header(0));
 
-			assert_ok!(Module::<TestRuntime>::initialize(Origin::root(), init_data.clone()));
+			let init_data = init_with_origin(Origin::root()).unwrap();
 
 			let storage = PalletStorage::<TestRuntime>::new();
 			assert!(storage.header_exists(init_data.header.hash()));
@@ -662,17 +785,9 @@ mod tests {
 	#[test]
 	fn init_can_only_initialize_pallet_once() {
 		run_test(|| {
-			let init_data = InitializationData {
-				header: test_header(1),
-				authority_list: authority_list(),
-				set_id: 1,
-				scheduled_change: None,
-				is_halted: false,
-			};
-
-			assert_ok!(Module::<TestRuntime>::initialize(Origin::root(), init_data.clone()));
+			assert_ok!(init_with_origin(Origin::root()));
 			assert_noop!(
-				Module::<TestRuntime>::initialize(Origin::root(), init_data),
+				init_with_origin(Origin::root()),
 				<Error<TestRuntime>>::AlreadyInitialized
 			);
 		})
@@ -800,5 +915,138 @@ mod tests {
 				(),
 			);
 		});
+	}
+
+	#[test]
+	fn importing_unchecked_headers_works() {
+		run_test(|| {
+			init_with_origin(Origin::root()).unwrap();
+			let storage = PalletStorage::<TestRuntime>::new();
+
+			let child = test_header(2);
+			let header = test_header(3);
+
+			let header_chain = vec![child.clone(), header.clone()];
+			assert_ok!(Module::<TestRuntime>::append_finalized_chain(header_chain));
+
+			assert!(storage.header_by_hash(child.hash()).unwrap().is_finalized);
+			assert!(storage.header_by_hash(header.hash()).unwrap().is_finalized);
+
+			assert_eq!(storage.best_finalized_header().header, header);
+			assert_eq!(storage.best_headers()[0].hash, header.hash());
+		})
+	}
+
+	#[test]
+	fn prevents_unchecked_header_import_if_headers_are_unrelated() {
+		run_test(|| {
+			init_with_origin(Origin::root()).unwrap();
+
+			// Pallet is expecting test_header(2) as the child
+			let not_a_child = test_header(3);
+			let header_chain = vec![not_a_child];
+
+			assert_noop!(
+				Module::<TestRuntime>::append_finalized_chain(header_chain),
+				Error::<TestRuntime>::NotDescendant,
+			);
+		})
+	}
+
+	#[test]
+	fn importing_unchecked_headers_enacts_new_authority_set() {
+		run_test(|| {
+			init_with_origin(Origin::root()).unwrap();
+			let storage = PalletStorage::<TestRuntime>::new();
+
+			let next_set_id = 2;
+			let next_authorities = vec![(alice(), 1), (bob(), 1)];
+
+			// Need to update the header digest to indicate that our header signals an authority set
+			// change. The change will be enacted when we import our header.
+			let mut header = test_header(2);
+			header.digest = fork_tests::change_log(0);
+
+			// Let's import our test header
+			assert_ok!(Module::<TestRuntime>::append_finalized_chain(vec![header.clone()]));
+
+			// Make sure that our header is the best finalized
+			assert_eq!(storage.best_finalized_header().header, header);
+			assert_eq!(storage.best_headers()[0].hash, header.hash());
+
+			// Make sure that the authority set actually changed upon importing our header
+			assert_eq!(
+				storage.current_authority_set(),
+				AuthoritySet::new(next_authorities, next_set_id),
+			);
+		})
+	}
+
+	#[test]
+	fn importing_unchecked_headers_enacts_new_authority_set_from_old_header() {
+		run_test(|| {
+			init_with_origin(Origin::root()).unwrap();
+			let storage = PalletStorage::<TestRuntime>::new();
+
+			let next_set_id = 2;
+			let next_authorities = vec![(alice(), 1), (bob(), 1)];
+
+			// Need to update the header digest to indicate that our header signals an authority set
+			// change. However, the change doesn't happen until the next block.
+			let mut schedules_change = test_header(2);
+			schedules_change.digest = fork_tests::change_log(1);
+			let header = test_header(3);
+
+			// Let's import our test headers
+			let header_chain = vec![schedules_change, header.clone()];
+			assert_ok!(Module::<TestRuntime>::append_finalized_chain(header_chain));
+
+			// Make sure that our header is the best finalized
+			assert_eq!(storage.best_finalized_header().header, header);
+			assert_eq!(storage.best_headers()[0].hash, header.hash());
+
+			// Make sure that the authority set actually changed upon importing our header
+			assert_eq!(
+				storage.current_authority_set(),
+				AuthoritySet::new(next_authorities, next_set_id),
+			);
+		})
+	}
+
+	#[test]
+	fn importing_unchecked_header_can_enact_set_change_scheduled_at_genesis() {
+		run_test(|| {
+			let storage = PalletStorage::<TestRuntime>::new();
+
+			let next_authorities = vec![(alice(), 1)];
+			let next_set_id = 2;
+			let next_authority_set = AuthoritySet::new(next_authorities.clone(), next_set_id);
+
+			let first_scheduled_change = ScheduledChange {
+				authority_set: next_authority_set,
+				height: 2,
+			};
+
+			let init_data = InitializationData {
+				header: test_header(1),
+				authority_list: authority_list(),
+				set_id: 1,
+				scheduled_change: Some(first_scheduled_change),
+				is_halted: false,
+			};
+
+			assert_ok!(Module::<TestRuntime>::initialize(Origin::root(), init_data));
+
+			// We are expecting an authority set change at height 2, so this header should enact
+			// that upon being imported.
+			let header_chain = vec![test_header(2)];
+			assert_ok!(Module::<TestRuntime>::append_finalized_chain(header_chain));
+
+			// Make sure that the authority set actually changed upon importing our header
+			assert_eq!(
+				storage.current_authority_set(),
+				AuthoritySet::new(next_authorities, next_set_id),
+			);
+		})
 	}
 }

@@ -54,11 +54,12 @@
 //! Import a finality proof for header 2 on fork 1. This finalty proof should fail to be imported
 //! because the header is an old header.
 
-use crate::justification::tests::*;
-use crate::mock::{helpers::*, *};
-use crate::storage::{AuthoritySet, ImportedHeader};
+use crate::mock::*;
+use crate::storage::ImportedHeader;
 use crate::verifier::*;
 use crate::{BestFinalized, BestHeight, BridgeStorage, NextScheduledChange, PalletStorage};
+use bp_header_chain::AuthoritySet;
+use bp_test_utils::{alice, authority_list, bob, make_justification_for_header};
 use codec::Encode;
 use frame_support::{IterableStorageMap, StorageValue};
 use sp_finality_grandpa::{ConsensusLog, GRANDPA_ENGINE_ID};
@@ -134,7 +135,7 @@ fn fork_does_not_allow_competing_finality_proofs() {
 //
 // Not allowed to import 3 until we get F2
 //
-// Note: Grandpa would technically allow 3 to be imported as long as it didn't try and enact an
+// Note: GRANDPA would technically allow 3 to be imported as long as it didn't try and enact an
 // authority set change. However, since we expect finality proofs to be imported quickly we've
 // decided to simplify our import process and disallow header imports until we get a finality proof.
 #[test]
@@ -161,9 +162,9 @@ fn fork_waits_for_finality_proof_before_importing_header_past_one_which_enacts_a
 //
 // [1] <- [2: S|1] <- [3: S|0]
 //
-// Grandpa can have multiple authority set changes pending on the same fork. However, we've decided
+// GRANDPA can have multiple authority set changes pending on the same fork. However, we've decided
 // to introduce a limit of _one_ pending authority set change per fork in order to simplify pallet
-// logic and to prevent DoS attacks if Grandpa finality were to temporarily stall for a long time
+// logic and to prevent DoS attacks if GRANDPA finality were to temporarily stall for a long time
 // (we'd have to perform a lot of expensive ancestry checks to catch back up).
 #[test]
 fn fork_does_not_allow_multiple_scheduled_changes_on_the_same_fork() {
@@ -397,7 +398,9 @@ where
 						}
 
 						// Try and import into storage
-						let res = verifier.import_header(header.clone()).map_err(TestError::Import);
+						let res = verifier
+							.import_header(header.hash(), header.clone())
+							.map_err(TestError::Import);
 						assert_eq!(
 							res, *expected_result,
 							"Expected {:?} while importing header ({}, {}), got {:?}",
@@ -427,7 +430,9 @@ where
 						header.digest = change_log(*delay);
 					}
 
-					let res = verifier.import_header(header.clone()).map_err(TestError::Import);
+					let res = verifier
+						.import_header(header.hash(), header.clone())
+						.map_err(TestError::Import);
 					assert_eq!(
 						res, *expected_result,
 						"Expected {:?} while importing header ({}, {}), got {:?}",
@@ -452,8 +457,7 @@ where
 				let grandpa_round = 1;
 				let set_id = 1;
 				let authorities = authority_list();
-				let justification =
-					make_justification_for_header(&header, grandpa_round, set_id, &authorities).encode();
+				let justification = make_justification_for_header(header, grandpa_round, set_id, &authorities).encode();
 
 				let res = verifier
 					.import_finality_proof(header.hash(), justification.into())
@@ -499,7 +503,7 @@ where
 	storage.update_current_authority_set(authority_set);
 }
 
-fn change_log(delay: u64) -> Digest<TestHash> {
+pub(crate) fn change_log(delay: u64) -> Digest<TestHash> {
 	let consensus_log = ConsensusLog::<TestNumber>::ScheduledChange(sp_finality_grandpa::ScheduledChange {
 		next_authorities: vec![(alice(), 1), (bob(), 1)],
 		delay,

@@ -17,8 +17,8 @@
 //! Rialto-to-Millau headers sync entrypoint.
 
 use crate::{
-	headers_pipeline::SubstrateHeadersToSubstrate, headers_target::SubstrateHeadersSyncPipeline, MillauClient,
-	RialtoClient,
+	headers_pipeline::{SubstrateHeadersSyncPipeline, SubstrateHeadersToSubstrate},
+	MillauClient, RialtoClient,
 };
 
 use async_trait::async_trait;
@@ -53,7 +53,7 @@ impl SubstrateHeadersSyncPipeline for RialtoHeadersToMillau {
 	) -> Result<Self::SignedTransaction, SubstrateError> {
 		let account_id = self.target_sign.signer.public().as_array_ref().clone().into();
 		let nonce = self.target_client.next_account_index(account_id).await?;
-		let call = BridgeRialtoCall::import_signed_header(header.header().clone().into()).into();
+		let call = BridgeRialtoCall::import_signed_header(header.header().clone().into_inner()).into();
 		let transaction = Millau::sign_transaction(&self.target_client, &self.target_sign.signer, nonce, call);
 		Ok(transaction)
 	}

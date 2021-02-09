@@ -26,10 +26,11 @@ use bp_message_lane::{
 use bp_runtime::{InstanceId, MILLAU_BRIDGE_INSTANCE};
 use bridge_runtime_common::messages::{self, ChainWithMessageLanes, MessageBridge};
 use frame_support::{
-	weights::{Weight, WeightToFeePolynomial},
+	weights::{DispatchClass, Weight, WeightToFeePolynomial},
 	RuntimeDebug,
 };
 use sp_core::storage::StorageKey;
+use sp_std::{convert::TryFrom, ops::RangeInclusive};
 
 /// Storage key of the Rialto -> Millau message in the runtime storage.
 pub fn message_key(lane: &LaneId, nonce: MessageNonce) -> StorageKey {
@@ -62,6 +63,9 @@ pub type ToMillauMessageVerifier = messages::source::FromThisChainMessageVerifie
 /// Message payload for Millau -> Rialto messages.
 pub type FromMillauMessagePayload = messages::target::FromBridgedChainMessagePayload<WithMillauMessageBridge>;
 
+/// Encoded Rialto Call as it comes from Millau.
+pub type FromMillauEncodedCall = messages::target::FromBridgedChainEncodedMessageCall<WithMillauMessageBridge>;
+
 /// Call-dispatch based message dispatch for Millau -> Rialto messages.
 pub type FromMillauMessageDispatch = messages::target::FromBridgedChainMessageDispatch<
 	WithMillauMessageBridge,
@@ -70,10 +74,11 @@ pub type FromMillauMessageDispatch = messages::target::FromBridgedChainMessageDi
 >;
 
 /// Messages proof for Millau -> Rialto messages.
-type FromMillauMessagesProof = messages::target::FromBridgedChainMessagesProof<WithMillauMessageBridge>;
+pub type FromMillauMessagesProof = messages::target::FromBridgedChainMessagesProof<WithMillauMessageBridge>;
 
 /// Messages delivery proof for Rialto -> Millau messages.
-type ToMillauMessagesDeliveryProof = messages::source::FromBridgedChainMessagesDeliveryProof<WithMillauMessageBridge>;
+pub type FromMillauMessagesDeliveryProof =
+	messages::source::FromBridgedChainMessagesDeliveryProof<WithMillauMessageBridge>;
 
 /// Millau <-> Rialto message bridge.
 #[derive(RuntimeDebug, Clone, Copy)]
@@ -87,35 +92,59 @@ impl MessageBridge for WithMillauMessageBridge {
 	type ThisChain = Rialto;
 	type BridgedChain = Millau;
 
-	fn maximal_dispatch_weight_of_message_on_bridged_chain() -> Weight {
-		// we don't want to relay too large messages + keep reserve for future upgrades
-		bp_millau::MAXIMUM_EXTRINSIC_WEIGHT / 2
+	fn maximal_extrinsic_size_on_target_chain() -> u32 {
+		bp_millau::max_extrinsic_size()
 	}
 
-	fn weight_of_delivery_transaction() -> Weight {
-		0 // TODO: https://github.com/paritytech/parity-bridges-common/issues/391
+	fn weight_limits_of_message_on_bridged_chain(message_payload: &[u8]) -> RangeInclusive<Weight> {
+		// we don't want to relay too large messages + keep reserve for future upgrades
+		let upper_limit = bp_millau::max_extrinsic_weight() / 2;
+
+		// given Millau chain parameters (`TransactionByteFee`, `WeightToFee`, `FeeMultiplierUpdate`),
+		// the minimal weight of the message may be computed as message.length()
+		let lower_limit = u32::try_from(message_payload.len())
+			.map(Into::into)
+			.unwrap_or(Weight::MAX);
+
+		lower_limit..=upper_limit
+	}
+
+	fn weight_of_delivery_transaction(message_payload: &[u8]) -> Weight {
+		messages::transaction_weight_without_multiplier(
+			bp_millau::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
+			u32::try_from(message_payload.len())
+				.map(Into::into)
+				.unwrap_or(Weight::MAX)
+				.saturating_add(bp_rialto::EXTRA_STORAGE_PROOF_SIZE as _),
+			bp_millau::MAX_SINGLE_MESSAGE_DELIVERY_TX_WEIGHT,
+		)
 	}
 
 	fn weight_of_delivery_confirmation_transaction_on_this_chain() -> Weight {
-		0 // TODO: https://github.com/paritytech/parity-bridges-common/issues/391
-	}
+		let inbounded_data_size: Weight =
+			InboundLaneData::<bp_millau::AccountId>::encoded_size_hint(bp_millau::MAXIMAL_ENCODED_ACCOUNT_ID_SIZE, 1)
+				.map(Into::into)
+				.unwrap_or(Weight::MAX);
 
-	fn weight_of_reward_confirmation_transaction_on_target_chain() -> Weight {
-		0 // TODO: https://github.com/paritytech/parity-bridges-common/issues/391
+		messages::transaction_weight_without_multiplier(
+			bp_millau::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
+			inbounded_data_size.saturating_add(bp_millau::EXTRA_STORAGE_PROOF_SIZE as _),
+			bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_CONFIRMATION_TX_WEIGHT,
+		)
 	}
 
 	fn this_weight_to_this_balance(weight: Weight) -> bp_rialto::Balance {
-		<crate::Runtime as pallet_transaction_payment::Trait>::WeightToFee::calc(&weight)
+		<crate::Runtime as pallet_transaction_payment::Config>::WeightToFee::calc(&weight)
 	}
 
 	fn bridged_weight_to_bridged_balance(weight: Weight) -> bp_millau::Balance {
 		// we're using the same weights in both chains now
-		<crate::Runtime as pallet_transaction_payment::Trait>::WeightToFee::calc(&weight) as _
+		<crate::Runtime as pallet_transaction_payment::Config>::WeightToFee::calc(&weight) as _
 	}
 
-	fn this_balance_to_bridged_balance(this_balance: bp_rialto::Balance) -> bp_millau::Balance {
+	fn bridged_balance_to_this_balance(bridged_balance: bp_millau::Balance) -> bp_rialto::Balance {
 		// 1:1 conversion that will probably change in the future
-		this_balance as _
+		bridged_balance as _
 	}
 }
 
@@ -132,7 +161,7 @@ impl messages::ChainWithMessageLanes for Rialto {
 	type Weight = Weight;
 	type Balance = bp_rialto::Balance;
 
-	type MessageLaneInstance = pallet_message_lane::DefaultInstance;
+	type MessageLaneInstance = crate::WithMillauMessageLaneInstance;
 }
 
 /// Millau chain from message lane point of view.
@@ -157,14 +186,10 @@ impl TargetHeaderChain<ToMillauMessagePayload, bp_millau::AccountId> for Millau 
 	// - hash of the header this proof has been created with;
 	// - the storage proof of one or several keys;
 	// - id of the lane we prove state of.
-	type MessagesDeliveryProof = ToMillauMessagesDeliveryProof;
+	type MessagesDeliveryProof = FromMillauMessagesDeliveryProof;
 
 	fn verify_message(payload: &ToMillauMessagePayload) -> Result<(), Self::Error> {
-		if payload.weight > WithMillauMessageBridge::maximal_dispatch_weight_of_message_on_bridged_chain() {
-			return Err("Payload has weight larger than maximum allowed weight");
-		}
-
-		Ok(())
+		messages::source::verify_chain_message::<WithMillauMessageBridge>(payload)
 	}
 
 	fn verify_messages_delivery_proof(
@@ -185,7 +210,8 @@ impl SourceHeaderChain<bp_millau::Balance> for Millau {
 
 	fn verify_messages_proof(
 		proof: Self::MessagesProof,
+		messages_count: u32,
 	) -> Result<ProvedMessages<Message<bp_millau::Balance>>, Self::Error> {
-		messages::target::verify_messages_proof::<WithMillauMessageBridge, Runtime>(proof)
+		messages::target::verify_messages_proof::<WithMillauMessageBridge, Runtime>(proof, messages_count)
 	}
 }

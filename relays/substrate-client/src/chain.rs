@@ -40,8 +40,7 @@ pub trait Chain: ChainBase {
 
 	/// The user account identifier type for the runtime.
 	type AccountId: Parameter + Member + MaybeSerializeDeserialize + Debug + MaybeDisplay + Ord + Default;
-	/// Account index (aka nonce) type. This stores the number of previous transactions associated
-	/// with a sender account.
+	/// Index of a transaction used by the chain.
 	type Index: Parameter
 		+ Member
 		+ MaybeSerialize
@@ -57,7 +56,7 @@ pub trait Chain: ChainBase {
 	type Call: Dispatchable + Debug;
 }
 
-/// Substrate-based chain with `frame_system::Trait::AccountData` set to
+/// Substrate-based chain with `frame_system::Config::AccountData` set to
 /// the `pallet_balances::AccountData<NativeBalance>`.
 pub trait ChainWithBalances: Chain {
 	/// Balance of an account in native tokens.

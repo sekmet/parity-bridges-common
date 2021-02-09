@@ -18,110 +18,103 @@
 //! runtime that implements `<BridgedChainName>HeaderApi` to allow bridging with
 //! <BridgedName> chain.
 
+use crate::messages_lane::SubstrateMessageLane;
 use crate::messages_source::read_client_state;
 
 use async_trait::async_trait;
-use bp_message_lane::{LaneId, MessageNonce};
+use bp_message_lane::{LaneId, MessageNonce, UnrewardedRelayersState};
 use bp_runtime::InstanceId;
 use codec::{Decode, Encode};
 use messages_relay::{
-	message_lane::{MessageLane, SourceHeaderIdOf, TargetHeaderIdOf},
+	message_lane::{SourceHeaderIdOf, TargetHeaderIdOf},
 	message_lane_loop::{TargetClient, TargetClientState},
 };
 use relay_substrate_client::{Chain, Client, Error as SubstrateError, HashOf};
-use relay_utils::BlockNumberBase;
+use relay_utils::{relay_loop::Client as RelayClient, BlockNumberBase};
 use sp_core::Bytes;
 use sp_runtime::{traits::Header as HeaderT, DeserializeOwned};
 use sp_trie::StorageProof;
-use std::{marker::PhantomData, ops::RangeInclusive};
+use std::ops::RangeInclusive;
+
+/// Message receiving proof returned by the target Substrate node.
+pub type SubstrateMessagesReceivingProof<C> = (UnrewardedRelayersState, (HashOf<C>, StorageProof, LaneId));
 
 /// Substrate client as Substrate messages target.
-pub struct SubstrateMessagesTarget<C: Chain, P, M> {
+pub struct SubstrateMessagesTarget<C: Chain, P> {
 	client: Client<C>,
-	tx_maker: M,
-	lane: LaneId,
+	lane: P,
+	lane_id: LaneId,
 	instance: InstanceId,
-	_marker: PhantomData<P>,
 }
 
-/// Substrate transactions maker.
-#[async_trait]
-pub trait SubstrateTransactionMaker<C: Chain, P: MessageLane>: Clone + Send + Sync {
-	/// Signed transaction type.
-	type SignedTransaction: Send + Sync + Encode;
-
-	/// Make messages delivery transaction.
-	async fn make_messages_delivery_transaction(
-		&self,
-		generated_at_header: SourceHeaderIdOf<P>,
-		nonces: RangeInclusive<MessageNonce>,
-		proof: P::MessagesProof,
-	) -> Result<Self::SignedTransaction, SubstrateError>;
-}
-
-impl<C: Chain, P, M> SubstrateMessagesTarget<C, P, M> {
+impl<C: Chain, P> SubstrateMessagesTarget<C, P> {
 	/// Create new Substrate headers target.
-	pub fn new(client: Client<C>, tx_maker: M, lane: LaneId, instance: InstanceId) -> Self {
+	pub fn new(client: Client<C>, lane: P, lane_id: LaneId, instance: InstanceId) -> Self {
 		SubstrateMessagesTarget {
 			client,
-			tx_maker,
 			lane,
+			lane_id,
 			instance,
-			_marker: Default::default(),
 		}
 	}
 }
 
-impl<C: Chain, P, M: Clone> Clone for SubstrateMessagesTarget<C, P, M> {
+impl<C: Chain, P: SubstrateMessageLane> Clone for SubstrateMessagesTarget<C, P> {
 	fn clone(&self) -> Self {
 		Self {
 			client: self.client.clone(),
-			tx_maker: self.tx_maker.clone(),
-			lane: self.lane,
+			lane: self.lane.clone(),
+			lane_id: self.lane_id,
 			instance: self.instance,
-			_marker: Default::default(),
 		}
 	}
 }
 
 #[async_trait]
-impl<C, P, M> TargetClient<P> for SubstrateMessagesTarget<C, P, M>
+impl<C: Chain, P: SubstrateMessageLane> RelayClient for SubstrateMessagesTarget<C, P> {
+	type Error = SubstrateError;
+
+	async fn reconnect(&mut self) -> Result<(), SubstrateError> {
+		self.client.reconnect().await
+	}
+}
+
+#[async_trait]
+impl<C, P> TargetClient<P> for SubstrateMessagesTarget<C, P>
 where
 	C: Chain,
 	C::Header: DeserializeOwned,
 	C::Index: DeserializeOwned,
 	<C::Header as HeaderT>::Number: BlockNumberBase,
-	P: MessageLane<
-		MessagesReceivingProof = (HashOf<C>, StorageProof, LaneId),
+	P: SubstrateMessageLane<
+		MessagesReceivingProof = SubstrateMessagesReceivingProof<C>,
 		TargetHeaderNumber = <C::Header as HeaderT>::Number,
 		TargetHeaderHash = <C::Header as HeaderT>::Hash,
 	>,
 	P::SourceHeaderNumber: Decode,
 	P::SourceHeaderHash: Decode,
-	M: SubstrateTransactionMaker<C, P>,
 {
-	type Error = SubstrateError;
+	async fn state(&self) -> Result<TargetClientState<P>, SubstrateError> {
+		// we can't continue to deliver messages if target node is out of sync, because
+		// it may have already received (some of) messages that we're going to deliver
+		self.client.ensure_synced().await?;
 
-	async fn reconnect(mut self) -> Result<Self, Self::Error> {
-		let new_client = self.client.clone().reconnect().await?;
-		self.client = new_client;
-		Ok(self)
-	}
-
-	async fn state(&self) -> Result<TargetClientState<P>, Self::Error> {
-		read_client_state::<_, P::SourceHeaderHash, P::SourceHeaderNumber>(&self.client, P::SOURCE_NAME).await
+		read_client_state::<_, P::SourceHeaderHash, P::SourceHeaderNumber>(
+			&self.client,
+			P::BEST_FINALIZED_SOURCE_HEADER_ID_AT_TARGET,
+		)
+		.await
 	}
 
 	async fn latest_received_nonce(
 		&self,
 		id: TargetHeaderIdOf<P>,
-	) -> Result<(TargetHeaderIdOf<P>, MessageNonce), Self::Error> {
+	) -> Result<(TargetHeaderIdOf<P>, MessageNonce), SubstrateError> {
 		let encoded_response = self
 			.client
 			.state_call(
-				// TODO: https://github.com/paritytech/parity-bridges-common/issues/457
-				"InboundLaneApi_latest_received_nonce".into(),
-				Bytes(self.lane.encode()),
+				P::INBOUND_LANE_LATEST_RECEIVED_NONCE_METHOD.into(),
+				Bytes(self.lane_id.encode()),
 				Some(id.1),
 			)
 			.await?;
@@ -133,13 +126,12 @@ where
 	async fn latest_confirmed_received_nonce(
 		&self,
 		id: TargetHeaderIdOf<P>,
-	) -> Result<(TargetHeaderIdOf<P>, MessageNonce), Self::Error> {
+	) -> Result<(TargetHeaderIdOf<P>, MessageNonce), SubstrateError> {
 		let encoded_response = self
 			.client
 			.state_call(
-				// TODO: https://github.com/paritytech/parity-bridges-common/issues/457
-				"OutboundLaneApi_latest_received_nonce".into(),
-				Bytes(self.lane.encode()),
+				P::INBOUND_LANE_LATEST_CONFIRMED_NONCE_METHOD.into(),
+				Bytes(self.lane_id.encode()),
 				Some(id.1),
 			)
 			.await?;
@@ -148,16 +140,34 @@ where
 		Ok((id, latest_received_nonce))
 	}
 
+	async fn unrewarded_relayers_state(
+		&self,
+		id: TargetHeaderIdOf<P>,
+	) -> Result<(TargetHeaderIdOf<P>, UnrewardedRelayersState), SubstrateError> {
+		let encoded_response = self
+			.client
+			.state_call(
+				P::INBOUND_LANE_UNREWARDED_RELAYERS_STATE.into(),
+				Bytes(self.lane_id.encode()),
+				Some(id.1),
+			)
+			.await?;
+		let unrewarded_relayers_state: UnrewardedRelayersState =
+			Decode::decode(&mut &encoded_response.0[..]).map_err(SubstrateError::ResponseParseFailed)?;
+		Ok((id, unrewarded_relayers_state))
+	}
+
 	async fn prove_messages_receiving(
 		&self,
 		id: TargetHeaderIdOf<P>,
-	) -> Result<(TargetHeaderIdOf<P>, P::MessagesReceivingProof), Self::Error> {
+	) -> Result<(TargetHeaderIdOf<P>, P::MessagesReceivingProof), SubstrateError> {
+		let (id, relayers_state) = self.unrewarded_relayers_state(id).await?;
 		let proof = self
 			.client
-			.prove_messages_delivery(self.instance, self.lane, id.1)
+			.prove_messages_delivery(self.instance, self.lane_id, id.1)
 			.await?;
-		let proof = (id.1, proof, self.lane);
-		Ok((id, proof))
+		let proof = (id.1, proof, self.lane_id);
+		Ok((id, (relayers_state, proof)))
 	}
 
 	async fn submit_messages_proof(
@@ -165,9 +175,9 @@ where
 		generated_at_header: SourceHeaderIdOf<P>,
 		nonces: RangeInclusive<MessageNonce>,
 		proof: P::MessagesProof,
-	) -> Result<RangeInclusive<MessageNonce>, Self::Error> {
+	) -> Result<RangeInclusive<MessageNonce>, SubstrateError> {
 		let tx = self
-			.tx_maker
+			.lane
 			.make_messages_delivery_transaction(generated_at_header, nonces.clone(), proof)
 			.await?;
 		self.client.submit_extrinsic(Bytes(tx.encode())).await?;

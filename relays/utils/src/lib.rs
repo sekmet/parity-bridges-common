@@ -29,6 +29,7 @@ pub const CONNECTION_ERROR_DELAY: Duration = Duration::from_secs(10);
 
 pub mod initialize;
 pub mod metrics;
+pub mod relay_loop;
 
 /// Block number traits shared by all chains that relay is able to serve.
 pub trait BlockNumberBase:
@@ -147,11 +148,12 @@ impl ToString for StringifiedMaybeConnectionError {
 
 /// Exponential backoff for connection-unrelated errors retries.
 pub fn retry_backoff() -> ExponentialBackoff {
-	let mut backoff = ExponentialBackoff::default();
-	// we do not want relayer to stop
-	backoff.max_elapsed_time = None;
-	backoff.max_interval = MAX_BACKOFF_INTERVAL;
-	backoff
+	ExponentialBackoff {
+		// we do not want relayer to stop
+		max_elapsed_time: None,
+		max_interval: MAX_BACKOFF_INTERVAL,
+		..Default::default()
+	}
 }
 
 /// Compact format of IDs vector.

@@ -36,6 +36,9 @@ pub mod kovan;
 pub mod millau_messages;
 pub mod rialto_poa;
 
+use crate::millau_messages::{ToMillauMessagePayload, WithMillauMessageBridge};
+
+use bridge_runtime_common::messages::{source::estimate_message_dispatch_and_delivery_fee, MessageBridge};
 use codec::Decode;
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList};
 use sp_api::impl_runtime_apis;
@@ -56,7 +59,7 @@ use sp_version::RuntimeVersion;
 pub use frame_support::{
 	construct_runtime, parameter_types,
 	traits::{Currency, ExistenceRequirement, Imbalance, KeyOwnerProofSystem, Randomness},
-	weights::{IdentityFee, RuntimeDbWeight, Weight},
+	weights::{constants::WEIGHT_PER_SECOND, DispatchClass, IdentityFee, RuntimeDbWeight, Weight},
 	StorageValue,
 };
 
@@ -137,15 +140,6 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	transaction_version: 1,
 };
 
-pub const MILLISECS_PER_BLOCK: u64 = 6000;
-
-pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
-
-// These time units are defined in number of blocks.
-pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
-pub const HOURS: BlockNumber = MINUTES * 60;
-pub const DAYS: BlockNumber = HOURS * 24;
-
 /// The version information used to identify this runtime when compiled natively.
 #[cfg(feature = "std")]
 pub fn native_version() -> NativeVersion {
@@ -157,19 +151,15 @@ pub fn native_version() -> NativeVersion {
 
 parameter_types! {
 	pub const BlockHashCount: BlockNumber = 250;
-	pub const MaximumBlockWeight: Weight = bp_rialto::MAXIMUM_BLOCK_WEIGHT;
-	pub const ExtrinsicBaseWeight: Weight = 10_000_000;
-	pub const AvailableBlockRatio: Perbill = Perbill::from_percent(bp_rialto::AVAILABLE_BLOCK_RATIO);
-	pub MaximumExtrinsicWeight: Weight = bp_rialto::MAXIMUM_EXTRINSIC_WEIGHT;
-	pub const MaximumBlockLength: u32 = 5 * 1024 * 1024;
 	pub const Version: RuntimeVersion = VERSION;
 	pub const DbWeight: RuntimeDbWeight = RuntimeDbWeight {
 		read: 60_000_000, // ~0.06 ms = ~60 µs
 		write: 200_000_000, // ~0.2 ms = 200 µs
 	};
+	pub const SS58Prefix: u8 = 84;
 }
 
-impl frame_system::Trait for Runtime {
+impl frame_system::Config for Runtime {
 	/// The basic call filter to use in dispatchable.
 	type BaseCallFilter = ();
 	/// The identifier used to distinguish between accounts.
@@ -194,24 +184,6 @@ impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	/// Maximum number of block number to block hash mappings to keep (oldest pruned first).
 	type BlockHashCount = BlockHashCount;
-	/// Maximum weight of each block.
-	type MaximumBlockWeight = MaximumBlockWeight;
-	/// The weight of database operations that the runtime can invoke.
-	type DbWeight = DbWeight;
-	/// The weight of the overhead invoked on the block import process, independent of the
-	/// extrinsics included in that block.
-	type BlockExecutionWeight = ();
-	/// The base weight of any extrinsic processed by the runtime, independent of the
-	/// logic of that extrinsic. (Signature verification, nonce increment, fee, etc...)
-	type ExtrinsicBaseWeight = ExtrinsicBaseWeight;
-	/// The maximum weight that a single extrinsic of `Normal` dispatch class can have,
-	/// idependent of the logic of that extrinsics. (Roughly max block weight - average on
-	/// initialize cost).
-	type MaximumExtrinsicWeight = MaximumExtrinsicWeight;
-	/// Maximum size of all encoded transactions (in bytes) that are allowed in one block.
-	type MaximumBlockLength = MaximumBlockLength;
-	/// Portion of the block weight that is available to all normal transactions.
-	type AvailableBlockRatio = AvailableBlockRatio;
 	/// Version of the runtime.
 	type Version = Version;
 	/// Provides information about the pallet setup in the runtime.
@@ -225,14 +197,22 @@ impl frame_system::Trait for Runtime {
 	// TODO: update me (https://github.com/paritytech/parity-bridges-common/issues/78)
 	/// Weight information for the extrinsics of this pallet.
 	type SystemWeightInfo = ();
+	/// Block and extrinsics weights: base values and limits.
+	type BlockWeights = bp_rialto::BlockWeights;
+	/// The maximum length of a block (in bytes).
+	type BlockLength = bp_rialto::BlockLength;
+	/// The weight of database operations that the runtime can invoke.
+	type DbWeight = DbWeight;
+	/// The designated SS58 prefix of this chain.
+	type SS58Prefix = SS58Prefix;
 }
 
-impl pallet_aura::Trait for Runtime {
+impl pallet_aura::Config for Runtime {
 	type AuthorityId = AuraId;
 }
 
 type RialtoPoA = pallet_bridge_eth_poa::Instance1;
-impl pallet_bridge_eth_poa::Trait<RialtoPoA> for Runtime {
+impl pallet_bridge_eth_poa::Config<RialtoPoA> for Runtime {
 	type AuraConfiguration = rialto_poa::BridgeAuraConfiguration;
 	type FinalityVotesCachingInterval = rialto_poa::FinalityVotesCachingInterval;
 	type ValidatorsConfiguration = rialto_poa::BridgeValidatorsConfiguration;
@@ -242,7 +222,7 @@ impl pallet_bridge_eth_poa::Trait<RialtoPoA> for Runtime {
 }
 
 type Kovan = pallet_bridge_eth_poa::Instance2;
-impl pallet_bridge_eth_poa::Trait<Kovan> for Runtime {
+impl pallet_bridge_eth_poa::Config<Kovan> for Runtime {
 	type AuraConfiguration = kovan::BridgeAuraConfiguration;
 	type FinalityVotesCachingInterval = kovan::FinalityVotesCachingInterval;
 	type ValidatorsConfiguration = kovan::BridgeValidatorsConfiguration;
@@ -252,7 +232,7 @@ impl pallet_bridge_eth_poa::Trait<Kovan> for Runtime {
 }
 
 type RialtoCurrencyExchange = pallet_bridge_currency_exchange::Instance1;
-impl pallet_bridge_currency_exchange::Trait<RialtoCurrencyExchange> for Runtime {
+impl pallet_bridge_currency_exchange::Config<RialtoCurrencyExchange> for Runtime {
 	type OnTransactionSubmitted = ();
 	type PeerBlockchain = rialto_poa::RialtoBlockchain;
 	type PeerMaybeLockFundsTransaction = exchange::EthTransaction;
@@ -263,7 +243,7 @@ impl pallet_bridge_currency_exchange::Trait<RialtoCurrencyExchange> for Runtime 
 }
 
 type KovanCurrencyExchange = pallet_bridge_currency_exchange::Instance2;
-impl pallet_bridge_currency_exchange::Trait<KovanCurrencyExchange> for Runtime {
+impl pallet_bridge_currency_exchange::Config<KovanCurrencyExchange> for Runtime {
 	type OnTransactionSubmitted = ();
 	type PeerBlockchain = kovan::KovanBlockchain;
 	type PeerMaybeLockFundsTransaction = exchange::EthTransaction;
@@ -273,13 +253,16 @@ impl pallet_bridge_currency_exchange::Trait<KovanCurrencyExchange> for Runtime {
 	type DepositInto = DepositInto;
 }
 
-impl pallet_bridge_call_dispatch::Trait for Runtime {
+impl pallet_bridge_call_dispatch::Config for Runtime {
 	type Event = Event;
 	type MessageId = (bp_message_lane::LaneId, bp_message_lane::MessageNonce);
 	type Call = Call;
-	type SourceChainAccountPublic = MultiSigner;
+	type CallFilter = ();
+	type EncodedCall = crate::millau_messages::FromMillauEncodedCall;
+	type SourceChainAccountId = bp_millau::AccountId;
 	type TargetChainAccountPublic = MultiSigner;
 	type TargetChainSignature = MultiSignature;
+	type AccountIdConverter = bp_rialto::AccountIdConverter;
 }
 
 pub struct DepositInto;
@@ -339,7 +322,7 @@ impl bp_currency_exchange::DepositInto for DepositInto {
 	}
 }
 
-impl pallet_grandpa::Trait for Runtime {
+impl pallet_grandpa::Config for Runtime {
 	type Event = Event;
 	type Call = Call;
 	type KeyOwnerProofSystem = ();
@@ -352,10 +335,10 @@ impl pallet_grandpa::Trait for Runtime {
 }
 
 parameter_types! {
-	pub const MinimumPeriod: u64 = SLOT_DURATION / 2;
+	pub const MinimumPeriod: u64 = bp_rialto::SLOT_DURATION / 2;
 }
 
-impl pallet_timestamp::Trait for Runtime {
+impl pallet_timestamp::Config for Runtime {
 	/// A timestamp: milliseconds since the unix epoch.
 	type Moment = u64;
 	type OnTimestampSet = Aura;
@@ -371,7 +354,7 @@ parameter_types! {
 	pub const MaxLocks: u32 = 50;
 }
 
-impl pallet_balances::Trait for Runtime {
+impl pallet_balances::Config for Runtime {
 	/// The type for recording an account's balance.
 	type Balance = Balance;
 	/// The ubiquitous event type.
@@ -389,27 +372,26 @@ parameter_types! {
 	pub const TransactionByteFee: Balance = 1;
 }
 
-impl pallet_transaction_payment::Trait for Runtime {
-	type Currency = pallet_balances::Module<Runtime>;
-	type OnTransactionPayment = ();
+impl pallet_transaction_payment::Config for Runtime {
+	type OnChargeTransaction = pallet_transaction_payment::CurrencyAdapter<Balances, ()>;
 	type TransactionByteFee = TransactionByteFee;
 	type WeightToFee = IdentityFee<Balance>;
 	type FeeMultiplierUpdate = ();
 }
 
-impl pallet_sudo::Trait for Runtime {
+impl pallet_sudo::Config for Runtime {
 	type Event = Event;
 	type Call = Call;
 }
 
 parameter_types! {
-	pub const Period: BlockNumber = 4;
+	pub const Period: BlockNumber = bp_rialto::SESSION_LENGTH;
 	pub const Offset: BlockNumber = 0;
 }
 
-impl pallet_session::Trait for Runtime {
+impl pallet_session::Config for Runtime {
 	type Event = Event;
-	type ValidatorId = <Self as frame_system::Trait>::AccountId;
+	type ValidatorId = <Self as frame_system::Config>::AccountId;
 	type ValidatorIdOf = ();
 	type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
 	type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
@@ -421,20 +403,43 @@ impl pallet_session::Trait for Runtime {
 	type WeightInfo = ();
 }
 
-impl pallet_substrate_bridge::Trait for Runtime {
+impl pallet_substrate_bridge::Config for Runtime {
 	type BridgedChain = bp_millau::Millau;
 }
 
-impl pallet_shift_session_manager::Trait for Runtime {}
+parameter_types! {
+	// We'll use the length of a session on the bridged chain as our bound since GRANDPA is
+	// guaranteed to produce a justification every session.
+	pub const MaxHeadersInSingleProof: bp_millau::BlockNumber = bp_millau::SESSION_LENGTH;
+}
+
+impl pallet_finality_verifier::Config for Runtime {
+	type BridgedChain = bp_millau::Millau;
+	type HeaderChain = pallet_substrate_bridge::Module<Runtime>;
+	type AncestryChecker = bp_header_chain::LinearAncestryChecker;
+	type MaxHeadersInSingleProof = MaxHeadersInSingleProof;
+}
+
+impl pallet_shift_session_manager::Config for Runtime {}
 
 parameter_types! {
 	pub const MaxMessagesToPruneAtOnce: bp_message_lane::MessageNonce = 8;
-	pub const MaxUnconfirmedMessagesAtInboundLane: bp_message_lane::MessageNonce = bp_rialto::MAX_UNCONFIRMED_MESSAGES_AT_INBOUND_LANE;
+	pub const MaxUnrewardedRelayerEntriesAtInboundLane: bp_message_lane::MessageNonce =
+		bp_rialto::MAX_UNREWARDED_RELAYER_ENTRIES_AT_INBOUND_LANE;
+	pub const MaxUnconfirmedMessagesAtInboundLane: bp_message_lane::MessageNonce =
+		bp_rialto::MAX_UNCONFIRMED_MESSAGES_AT_INBOUND_LANE;
+	// `IdentityFee` is used by Rialto => we may use weight directly
+	pub const GetDeliveryConfirmationTransactionFee: Balance =
+		bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_CONFIRMATION_TX_WEIGHT as _;
+	pub const RootAccountForPayments: Option<AccountId> = None;
 }
 
-impl pallet_message_lane::Trait for Runtime {
+pub(crate) type WithMillauMessageLaneInstance = pallet_message_lane::DefaultInstance;
+impl pallet_message_lane::Config for Runtime {
 	type Event = Event;
+	type WeightInfo = pallet_message_lane::weights::RialtoWeight<Runtime>;
 	type MaxMessagesToPruneAtOnce = MaxMessagesToPruneAtOnce;
+	type MaxUnrewardedRelayerEntriesAtInboundLane = MaxUnrewardedRelayerEntriesAtInboundLane;
 	type MaxUnconfirmedMessagesAtInboundLane = MaxUnconfirmedMessagesAtInboundLane;
 
 	type OutboundPayload = crate::millau_messages::ToMillauMessagePayload;
@@ -444,10 +449,16 @@ impl pallet_message_lane::Trait for Runtime {
 	type InboundMessageFee = bp_millau::Balance;
 	type InboundRelayer = bp_millau::AccountId;
 
+	type AccountIdConverter = bp_rialto::AccountIdConverter;
+
 	type TargetHeaderChain = crate::millau_messages::Millau;
 	type LaneMessageVerifier = crate::millau_messages::ToMillauMessageVerifier;
-	type MessageDeliveryAndDispatchPayment =
-		pallet_message_lane::instant_payments::InstantCurrencyPayments<AccountId, pallet_balances::Module<Runtime>>;
+	type MessageDeliveryAndDispatchPayment = pallet_message_lane::instant_payments::InstantCurrencyPayments<
+		Runtime,
+		pallet_balances::Module<Runtime>,
+		GetDeliveryConfirmationTransactionFee,
+		RootAccountForPayments,
+	>;
 
 	type SourceHeaderChain = crate::millau_messages::Millau;
 	type MessageDispatch = crate::millau_messages::FromMillauMessageDispatch;
@@ -464,8 +475,9 @@ construct_runtime!(
 		BridgeRialtoCurrencyExchange: pallet_bridge_currency_exchange::<Instance1>::{Module, Call},
 		BridgeKovanCurrencyExchange: pallet_bridge_currency_exchange::<Instance2>::{Module, Call},
 		BridgeMillau: pallet_substrate_bridge::{Module, Call, Storage, Config<T>},
+		BridgeFinalityVerifier: pallet_finality_verifier::{Module, Call},
 		BridgeCallDispatch: pallet_bridge_call_dispatch::{Module, Event<T>},
-		BridgeMillauMessageLane: pallet_message_lane::{Module, Call, Event<T>},
+		BridgeMillauMessageLane: pallet_message_lane::{Module, Call, Storage, Event<T>},
 		System: frame_system::{Module, Call, Config, Storage, Event<T>},
 		RandomnessCollectiveFlip: pallet_randomness_collective_flip::{Module, Call, Storage},
 		Timestamp: pallet_timestamp::{Module, Call, Storage, Inherent},
@@ -704,19 +716,28 @@ impl_runtime_apis! {
 		}
 	}
 
-	// TODO: runtime should support several chains (https://github.com/paritytech/parity-bridges-common/issues/457)
-	impl bp_message_lane::OutboundLaneApi<Block> for Runtime {
+	impl bp_millau::ToMillauOutboundLaneApi<Block, Balance, ToMillauMessagePayload> for Runtime {
+		fn estimate_message_delivery_and_dispatch_fee(
+			_lane_id: bp_message_lane::LaneId,
+			payload: ToMillauMessagePayload,
+		) -> Option<Balance> {
+			estimate_message_dispatch_and_delivery_fee::<WithMillauMessageBridge>(
+				&payload,
+				WithMillauMessageBridge::RELAYER_FEE_PERCENT,
+			).ok()
+		}
+
 		fn messages_dispatch_weight(
 			lane: bp_message_lane::LaneId,
 			begin: bp_message_lane::MessageNonce,
 			end: bp_message_lane::MessageNonce,
-		) -> Vec<(bp_message_lane::MessageNonce, Weight)> {
+		) -> Vec<(bp_message_lane::MessageNonce, Weight, u32)> {
 			(begin..=end).filter_map(|nonce| {
 				let encoded_payload = BridgeMillauMessageLane::outbound_message_payload(lane, nonce)?;
 				let decoded_payload = millau_messages::ToMillauMessagePayload::decode(
 					&mut &encoded_payload[..]
 				).ok()?;
-				Some((nonce, decoded_payload.weight))
+				Some((nonce, decoded_payload.weight, encoded_payload.len() as _))
 			})
 			.collect()
 		}
@@ -730,14 +751,17 @@ impl_runtime_apis! {
 		}
 	}
 
-	// TODO: runtime should support several chains (https://github.com/paritytech/parity-bridges-common/issues/457)
-	impl bp_message_lane::InboundLaneApi<Block> for Runtime {
+	impl bp_millau::FromMillauInboundLaneApi<Block> for Runtime {
 		fn latest_received_nonce(lane: bp_message_lane::LaneId) -> bp_message_lane::MessageNonce {
 			BridgeMillauMessageLane::inbound_latest_received_nonce(lane)
 		}
 
 		fn latest_confirmed_nonce(lane: bp_message_lane::LaneId) -> bp_message_lane::MessageNonce {
 			BridgeMillauMessageLane::inbound_latest_confirmed_nonce(lane)
+		}
+
+		fn unrewarded_relayers_state(lane: bp_message_lane::LaneId) -> bp_message_lane::UnrewardedRelayersState {
+			BridgeMillauMessageLane::inbound_unrewarded_relayers_state(lane)
 		}
 	}
 
@@ -765,18 +789,18 @@ impl_runtime_apis! {
 
 			use pallet_bridge_currency_exchange::benchmarking::{
 				Module as BridgeCurrencyExchangeBench,
-				Trait as BridgeCurrencyExchangeTrait,
+				Config as BridgeCurrencyExchangeConfig,
 				ProofParams as BridgeCurrencyExchangeProofParams,
 			};
 
-			impl BridgeCurrencyExchangeTrait<KovanCurrencyExchange> for Runtime {
+			impl BridgeCurrencyExchangeConfig<KovanCurrencyExchange> for Runtime {
 				fn make_proof(
 					proof_params: BridgeCurrencyExchangeProofParams<AccountId>,
 				) -> crate::exchange::EthereumTransactionInclusionProof {
 					use bp_currency_exchange::DepositInto;
 
 					if proof_params.recipient_exists {
-						<Runtime as pallet_bridge_currency_exchange::Trait<KovanCurrencyExchange>>::DepositInto::deposit_into(
+						<Runtime as pallet_bridge_currency_exchange::Config<KovanCurrencyExchange>>::DepositInto::deposit_into(
 							proof_params.recipient.clone(),
 							ExistentialDeposit::get(),
 						).unwrap();
@@ -803,6 +827,151 @@ impl_runtime_apis! {
 				}
 			}
 
+			use crate::millau_messages::{ToMillauMessagePayload, WithMillauMessageBridge};
+			use bridge_runtime_common::messages;
+			use pallet_message_lane::benchmarking::{
+				Module as MessageLaneBench,
+				Config as MessageLaneConfig,
+				MessageDeliveryProofParams as MessageLaneMessageDeliveryProofParams,
+				MessageParams as MessageLaneMessageParams,
+				MessageProofParams as MessageLaneMessageProofParams,
+			};
+
+			impl MessageLaneConfig<WithMillauMessageLaneInstance> for Runtime {
+				fn maximal_message_size() -> u32 {
+					messages::source::maximal_message_size::<WithMillauMessageBridge>()
+				}
+
+				fn bridged_relayer_id() -> Self::InboundRelayer {
+					Default::default()
+				}
+
+				fn account_balance(account: &Self::AccountId) -> Self::OutboundMessageFee {
+					pallet_balances::Module::<Runtime>::free_balance(account)
+				}
+
+				fn endow_account(account: &Self::AccountId) {
+					pallet_balances::Module::<Runtime>::make_free_balance_be(
+						account,
+						Balance::MAX / 100,
+					);
+				}
+
+				fn prepare_outbound_message(
+					params: MessageLaneMessageParams<Self::AccountId>,
+				) -> (millau_messages::ToMillauMessagePayload, Balance) {
+					let message_payload = vec![0; params.size as usize];
+					let dispatch_origin = pallet_bridge_call_dispatch::CallOrigin::SourceAccount(
+						params.sender_account,
+					);
+
+					let message = ToMillauMessagePayload {
+						spec_version: 0,
+						weight: params.size as _,
+						origin: dispatch_origin,
+						call: message_payload,
+					};
+					(message, pallet_message_lane::benchmarking::MESSAGE_FEE.into())
+				}
+
+				fn prepare_message_proof(
+					params: MessageLaneMessageProofParams,
+				) -> (millau_messages::FromMillauMessagesProof, Weight) {
+					use crate::millau_messages::{Millau, WithMillauMessageBridge};
+					use bp_message_lane::MessageKey;
+					use bridge_runtime_common::{
+						messages::ChainWithMessageLanes,
+						messages_benchmarking::{ed25519_sign, prepare_message_proof},
+					};
+					use codec::Encode;
+					use frame_support::weights::GetDispatchInfo;
+					use pallet_message_lane::storage_keys;
+					use sp_runtime::traits::Header;
+
+					let call = Call::System(SystemCall::remark(vec![]));
+					let call_weight = call.get_dispatch_info().weight;
+
+					let millau_account_id: bp_millau::AccountId = Default::default();
+					let (rialto_raw_public, rialto_raw_signature) = ed25519_sign(
+						&call,
+						&millau_account_id,
+					);
+					let rialto_public = MultiSigner::Ed25519(sp_core::ed25519::Public::from_raw(rialto_raw_public));
+					let rialto_signature = MultiSignature::Ed25519(sp_core::ed25519::Signature::from_raw(
+						rialto_raw_signature,
+					));
+
+					let make_millau_message_key = |message_key: MessageKey| storage_keys::message_key::<
+						Runtime,
+						<Millau as ChainWithMessageLanes>::MessageLaneInstance,
+					>(
+						&message_key.lane_id, message_key.nonce,
+					).0;
+					let make_millau_outbound_lane_data_key = |lane_id| storage_keys::outbound_lane_data_key::<
+						<Millau as ChainWithMessageLanes>::MessageLaneInstance,
+					>(
+						&lane_id,
+					).0;
+					let make_millau_header = |state_root| bp_millau::Header::new(
+						0,
+						Default::default(),
+						state_root,
+						Default::default(),
+						Default::default(),
+					);
+
+					prepare_message_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, _, _, _>(
+						params,
+						make_millau_message_key,
+						make_millau_outbound_lane_data_key,
+						make_millau_header,
+						call_weight,
+						pallet_bridge_call_dispatch::MessagePayload {
+							spec_version: VERSION.spec_version,
+							weight: call_weight,
+							origin: pallet_bridge_call_dispatch::CallOrigin::<
+								bp_millau::AccountId,
+								MultiSigner,
+								Signature,
+							>::TargetAccount(
+								millau_account_id,
+								rialto_public,
+								rialto_signature,
+							),
+							call: call.encode(),
+						}.encode(),
+					)
+				}
+
+				fn prepare_message_delivery_proof(
+					params: MessageLaneMessageDeliveryProofParams<Self::AccountId>,
+				) -> millau_messages::FromMillauMessagesDeliveryProof {
+					use crate::millau_messages::{Millau, WithMillauMessageBridge};
+					use bridge_runtime_common::{
+						messages::ChainWithMessageLanes,
+						messages_benchmarking::prepare_message_delivery_proof,
+					};
+					use sp_runtime::traits::Header;
+
+					prepare_message_delivery_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, _, _>(
+						params,
+						|lane_id| pallet_message_lane::storage_keys::inbound_lane_data_key::<
+							Runtime,
+							<Millau as ChainWithMessageLanes>::MessageLaneInstance,
+						>(
+							&lane_id,
+						).0,
+						|state_root| bp_millau::Header::new(
+							0,
+							Default::default(),
+							state_root,
+							Default::default(),
+							Default::default(),
+						),
+					)
+				}
+			}
+
 			add_benchmark!(params, batches, pallet_bridge_eth_poa, BridgeKovan);
 			add_benchmark!(
 				params,
@@ -810,11 +979,40 @@ impl_runtime_apis! {
 				pallet_bridge_currency_exchange,
 				BridgeCurrencyExchangeBench::<Runtime, KovanCurrencyExchange>
 			);
+			add_benchmark!(
+				params,
+				batches,
+				pallet_message_lane,
+				MessageLaneBench::<Runtime, WithMillauMessageLaneInstance>
+			);
 
 			if batches.is_empty() { return Err("Benchmark not found for this pallet.".into()) }
 			Ok(batches)
 		}
 	}
+}
+
+/// Millau account ownership digest from Rialto.
+///
+/// The byte vector returned by this function should be signed with a Millau account private key.
+/// This way, the owner of `rialto_account_id` on Rialto proves that the 'millau' account private key
+/// is also under his control.
+pub fn millau_account_ownership_digest<Call, AccountId, SpecVersion>(
+	millau_call: &Call,
+	rialto_account_id: AccountId,
+	millau_spec_version: SpecVersion,
+) -> sp_std::vec::Vec<u8>
+where
+	Call: codec::Encode,
+	AccountId: codec::Encode,
+	SpecVersion: codec::Encode,
+{
+	pallet_bridge_call_dispatch::account_ownership_digest(
+		millau_call,
+		rialto_account_id,
+		millau_spec_version,
+		bp_runtime::RIALTO_BRIDGE_INSTANCE,
+	)
 }
 
 #[cfg(test)]
@@ -858,12 +1056,20 @@ mod tests {
 	}
 
 	#[test]
+	fn ensure_rialto_message_lane_weights_are_correct() {
+		pallet_message_lane::ensure_weights_are_correct::<pallet_message_lane::weights::RialtoWeight<Runtime>>(
+			bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_TX_WEIGHT,
+			bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_CONFIRMATION_TX_WEIGHT,
+		);
+	}
+
+	#[test]
 	fn deposit_into_existing_account_works() {
 		run_deposit_into_test(|existing_account| {
 			let initial_amount =
 				<pallet_balances::Module<Runtime> as Currency<AccountId>>::free_balance(&existing_account);
 			let additional_amount = 10_000;
-			<Runtime as pallet_bridge_currency_exchange::Trait<KovanCurrencyExchange>>::DepositInto::deposit_into(
+			<Runtime as pallet_bridge_currency_exchange::Config<KovanCurrencyExchange>>::DepositInto::deposit_into(
 				existing_account.clone(),
 				additional_amount,
 			)
@@ -882,7 +1088,7 @@ mod tests {
 			let initial_amount = 0;
 			let additional_amount = ExistentialDeposit::get() + 10_000;
 			let new_account: AccountId = [42u8; 32].into();
-			<Runtime as pallet_bridge_currency_exchange::Trait<KovanCurrencyExchange>>::DepositInto::deposit_into(
+			<Runtime as pallet_bridge_currency_exchange::Config<KovanCurrencyExchange>>::DepositInto::deposit_into(
 				new_account.clone(),
 				additional_amount,
 			)

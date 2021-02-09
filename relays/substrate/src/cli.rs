@@ -101,20 +101,89 @@ pub enum Command {
 		/// Hex-encoded lane id.
 		#[structopt(long)]
 		lane: HexLaneId,
-		/// Message type.
-		#[structopt(long, possible_values = &ToRialtoMessage::variants())]
-		message: ToRialtoMessage,
-		/// Delivery and dispatch fee.
+		/// Delivery and dispatch fee. If not passed, determined automatically.
 		#[structopt(long)]
-		fee: bp_millau::Balance,
+		fee: Option<bp_millau::Balance>,
+		/// Message type.
+		#[structopt(subcommand)]
+		message: ToRialtoMessage,
+		/// The origin to use when dispatching the message on the target chain.
+		#[structopt(long, possible_values = &Origins::variants())]
+		origin: Origins,
+	},
+	/// Serve given lane of Rialto -> Millau messages.
+	RialtoMessagesToMillau {
+		#[structopt(flatten)]
+		rialto: RialtoConnectionParams,
+		#[structopt(flatten)]
+		rialto_sign: RialtoSigningParams,
+		#[structopt(flatten)]
+		millau: MillauConnectionParams,
+		#[structopt(flatten)]
+		millau_sign: MillauSigningParams,
+		#[structopt(flatten)]
+		prometheus_params: PrometheusParams,
+		/// Hex-encoded id of lane that should be served by relay.
+		#[structopt(long)]
+		lane: HexLaneId,
+	},
+	/// Submit message to given Rialto -> Millau lane.
+	SubmitRialtoToMillauMessage {
+		#[structopt(flatten)]
+		rialto: RialtoConnectionParams,
+		#[structopt(flatten)]
+		rialto_sign: RialtoSigningParams,
+		#[structopt(flatten)]
+		millau_sign: MillauSigningParams,
+		/// Hex-encoded lane id.
+		#[structopt(long)]
+		lane: HexLaneId,
+		/// Delivery and dispatch fee. If not passed, determined automatically.
+		#[structopt(long)]
+		fee: Option<bp_rialto::Balance>,
+		/// Message type.
+		#[structopt(subcommand)]
+		message: ToMillauMessage,
+		/// The origin to use when dispatching the message on the target chain.
+		#[structopt(long, possible_values = &Origins::variants())]
+		origin: Origins,
+	},
+}
+
+/// All possible messages that may be delivered to the Rialto chain.
+#[derive(StructOpt, Debug)]
+pub enum ToRialtoMessage {
+	/// Make an on-chain remark (comment).
+	Remark,
+	/// Transfer the specified `amount` of native tokens to a particular `recipient`.
+	Transfer {
+		#[structopt(long)]
+		recipient: bp_rialto::AccountId,
+		#[structopt(long)]
+		amount: bp_rialto::Balance,
+	},
+}
+
+/// All possible messages that may be delivered to the Millau chain.
+#[derive(StructOpt, Debug)]
+pub enum ToMillauMessage {
+	/// Make an on-chain remark (comment).
+	Remark,
+	/// Transfer the specified `amount` of native tokens to a particular `recipient`.
+	Transfer {
+		#[structopt(long)]
+		recipient: bp_millau::AccountId,
+		#[structopt(long)]
+		amount: bp_millau::Balance,
 	},
 }
 
 arg_enum! {
 	#[derive(Debug)]
-	/// All possible messages that may be delivered to the Rialto chain.
-	pub enum ToRialtoMessage {
-		Remark,
+	/// The origin to use when dispatching the message on the target chain.
+	pub enum Origins {
+		Target,
+		Source,
 	}
 }
 

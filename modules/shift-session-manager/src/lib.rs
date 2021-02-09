@@ -23,21 +23,21 @@ use frame_support::{decl_module, decl_storage};
 use sp_std::prelude::*;
 
 /// The module configuration trait.
-pub trait Trait: pallet_session::Trait {}
+pub trait Config: pallet_session::Config {}
 
 decl_module! {
 	/// Shift session manager pallet.
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {}
+	pub struct Module<T: Config> for enum Call where origin: T::Origin {}
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as ShiftSessionManager {
+	trait Store for Module<T: Config> as ShiftSessionManager {
 		/// Validators of first two sessions.
 		InitialValidators: Option<Vec<T::ValidatorId>>;
 	}
 }
 
-impl<T: Trait> pallet_session::SessionManager<T::ValidatorId> for Module<T> {
+impl<T: Config> pallet_session::SessionManager<T::ValidatorId> for Module<T> {
 	fn end_session(_: sp_staking::SessionIndex) {}
 	fn start_session(_: sp_staking::SessionIndex) {}
 	fn new_session(session_index: sp_staking::SessionIndex) -> Option<Vec<T::ValidatorId>> {
@@ -61,7 +61,7 @@ impl<T: Trait> pallet_session::SessionManager<T::ValidatorId> for Module<T> {
 	}
 }
 
-impl<T: Trait> Module<T> {
+impl<T: Config> Module<T> {
 	/// Select validators for session.
 	fn select_validators(
 		session_index: sp_staking::SessionIndex,
@@ -93,7 +93,7 @@ mod tests {
 		traits::{BlakeTwo256, ConvertInto, IdentityLookup},
 		Perbill, RuntimeAppPublic,
 	};
-	use frame_support::{impl_outer_origin, parameter_types, weights::Weight};
+	use frame_support::{impl_outer_origin, parameter_types, weights::Weight, BasicExternalities};
 	use sp_core::H256;
 
 	type AccountId = u64;
@@ -112,7 +112,7 @@ mod tests {
 		pub const AvailableBlockRatio: Perbill = Perbill::one();
 	}
 
-	impl frame_system::Trait for TestRuntime {
+	impl frame_system::Config for TestRuntime {
 		type Origin = Origin;
 		type Index = u64;
 		type Call = ();
@@ -124,13 +124,6 @@ mod tests {
 		type Header = Header;
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
-		type MaximumBlockWeight = MaximumBlockWeight;
-		type DbWeight = ();
-		type BlockExecutionWeight = ();
-		type ExtrinsicBaseWeight = ();
-		type MaximumExtrinsicWeight = ();
-		type AvailableBlockRatio = AvailableBlockRatio;
-		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
 		type PalletInfo = ();
 		type AccountData = ();
@@ -138,6 +131,10 @@ mod tests {
 		type OnKilledAccount = ();
 		type BaseCallFilter = ();
 		type SystemWeightInfo = ();
+		type BlockWeights = ();
+		type BlockLength = ();
+		type DbWeight = ();
+		type SS58Prefix = ();
 	}
 
 	parameter_types! {
@@ -145,9 +142,9 @@ mod tests {
 		pub const Offset: u64 = 0;
 	}
 
-	impl pallet_session::Trait for TestRuntime {
+	impl pallet_session::Config for TestRuntime {
 		type Event = ();
-		type ValidatorId = <Self as frame_system::Trait>::AccountId;
+		type ValidatorId = <Self as frame_system::Config>::AccountId;
 		type ValidatorIdOf = ConvertInto;
 		type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
 		type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
@@ -158,7 +155,7 @@ mod tests {
 		type WeightInfo = ();
 	}
 
-	impl Trait for TestRuntime {}
+	impl Config for TestRuntime {}
 
 	pub struct TestSessionHandler;
 	impl pallet_session::SessionHandler<AccountId> for TestSessionHandler {
@@ -175,17 +172,24 @@ mod tests {
 		let mut t = frame_system::GenesisConfig::default()
 			.build_storage::<TestRuntime>()
 			.unwrap();
-		pallet_session::GenesisConfig::<TestRuntime> {
-			keys: vec![
-				(1, 1, UintAuthorityId(1)),
-				(2, 2, UintAuthorityId(2)),
-				(3, 3, UintAuthorityId(3)),
-				(4, 4, UintAuthorityId(4)),
-				(5, 5, UintAuthorityId(5)),
-			],
-		}
-		.assimilate_storage(&mut t)
-		.unwrap();
+
+		let keys = vec![
+			(1, 1, UintAuthorityId(1)),
+			(2, 2, UintAuthorityId(2)),
+			(3, 3, UintAuthorityId(3)),
+			(4, 4, UintAuthorityId(4)),
+			(5, 5, UintAuthorityId(5)),
+		];
+
+		BasicExternalities::execute_with_storage(&mut t, || {
+			for (ref k, ..) in &keys {
+				frame_system::Module::<TestRuntime>::inc_providers(k);
+			}
+		});
+
+		pallet_session::GenesisConfig::<TestRuntime> { keys }
+			.assimilate_storage(&mut t)
+			.unwrap();
 		TestExternalities::new(t)
 	}
 

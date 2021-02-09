@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity Bridges Common.  If not, see <http://www.gnu.org/licenses/>.
 
+use bp_rialto::derive_account_from_millau_id;
 use rialto_runtime::{
 	AccountId, AuraConfig, BalancesConfig, BridgeKovanConfig, BridgeMillauConfig, BridgeRialtoPoAConfig, GenesisConfig,
 	GrandpaConfig, SessionConfig, SessionKeys, Signature, SudoConfig, SystemConfig, WASM_BINARY,
@@ -65,8 +66,8 @@ pub fn get_authority_keys_from_seed(s: &str) -> (AccountId, AuraId, GrandpaId) {
 
 impl Alternative {
 	/// Get an actual chain config from one of the alternatives.
-	pub(crate) fn load(self) -> Result<ChainSpec, String> {
-		Ok(match self {
+	pub(crate) fn load(self) -> ChainSpec {
+		match self {
 			Alternative::Development => ChainSpec::from_genesis(
 				"Development",
 				"dev",
@@ -111,12 +112,20 @@ impl Alternative {
 							get_account_id_from_seed::<sr25519::Public>("Dave"),
 							get_account_id_from_seed::<sr25519::Public>("Eve"),
 							get_account_id_from_seed::<sr25519::Public>("Ferdie"),
+							get_account_id_from_seed::<sr25519::Public>("George"),
+							get_account_id_from_seed::<sr25519::Public>("Harry"),
 							get_account_id_from_seed::<sr25519::Public>("Alice//stash"),
 							get_account_id_from_seed::<sr25519::Public>("Bob//stash"),
 							get_account_id_from_seed::<sr25519::Public>("Charlie//stash"),
 							get_account_id_from_seed::<sr25519::Public>("Dave//stash"),
 							get_account_id_from_seed::<sr25519::Public>("Eve//stash"),
 							get_account_id_from_seed::<sr25519::Public>("Ferdie//stash"),
+							get_account_id_from_seed::<sr25519::Public>("George//stash"),
+							get_account_id_from_seed::<sr25519::Public>("Harry//stash"),
+							pallet_message_lane::Module::<rialto_runtime::Runtime, pallet_message_lane::DefaultInstance>::relayer_fund_account_id(),
+							derive_account_from_millau_id(bp_runtime::SourceAccount::Account(
+								get_account_id_from_seed::<sr25519::Public>("Dave"),
+							)),
 						],
 						true,
 					)
@@ -127,7 +136,7 @@ impl Alternative {
 				None,
 				None,
 			),
-		})
+		}
 	}
 }
 
@@ -147,13 +156,13 @@ fn testnet_genesis(
 			changes_trie_config: Default::default(),
 		}),
 		pallet_balances: Some(BalancesConfig {
-			balances: endowed_accounts.iter().cloned().map(|k| (k, 1 << 60)).collect(),
+			balances: endowed_accounts.iter().cloned().map(|k| (k, 1 << 50)).collect(),
 		}),
 		pallet_aura: Some(AuraConfig {
 			authorities: Vec::new(),
 		}),
-		pallet_bridge_eth_poa_Instance1: load_rialto_poa_bridge_config(),
-		pallet_bridge_eth_poa_Instance2: load_kovan_bridge_config(),
+		pallet_bridge_eth_poa_Instance1: Some(load_rialto_poa_bridge_config()),
+		pallet_bridge_eth_poa_Instance2: Some(load_kovan_bridge_config()),
 		pallet_grandpa: Some(GrandpaConfig {
 			authorities: Vec::new(),
 		}),
@@ -172,18 +181,28 @@ fn testnet_genesis(
 	}
 }
 
-fn load_rialto_poa_bridge_config() -> Option<BridgeRialtoPoAConfig> {
-	Some(BridgeRialtoPoAConfig {
+fn load_rialto_poa_bridge_config() -> BridgeRialtoPoAConfig {
+	BridgeRialtoPoAConfig {
 		initial_header: rialto_runtime::rialto_poa::genesis_header(),
 		initial_difficulty: 0.into(),
 		initial_validators: rialto_runtime::rialto_poa::genesis_validators(),
-	})
+	}
 }
 
-fn load_kovan_bridge_config() -> Option<BridgeKovanConfig> {
-	Some(BridgeKovanConfig {
+fn load_kovan_bridge_config() -> BridgeKovanConfig {
+	BridgeKovanConfig {
 		initial_header: rialto_runtime::kovan::genesis_header(),
 		initial_difficulty: 0.into(),
 		initial_validators: rialto_runtime::kovan::genesis_validators(),
-	})
+	}
+}
+
+#[test]
+fn derived_dave_account_is_as_expected() {
+	let dave = get_account_id_from_seed::<sr25519::Public>("Dave");
+	let derived: AccountId = derive_account_from_millau_id(bp_runtime::SourceAccount::Account(dave));
+	assert_eq!(
+		derived.to_string(),
+		"5HZhdv53gSJmWWtD8XR5Ypu4PgbT5JNWwGw2mkE75cN61w9t".to_string()
+	);
 }
