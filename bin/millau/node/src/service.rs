@@ -105,7 +105,7 @@ pub fn new_partial(
 		Some(Box::new(grandpa_block_import)),
 		client.clone(),
 		inherent_data_providers.clone(),
-		&task_manager.spawn_handle(),
+		&task_manager.spawn_essential_handle(),
 		config.prometheus_registry(),
 		sp_consensus::CanAuthorWithNativeVersion::new(client.executor().clone()),
 	)?;
@@ -224,6 +224,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		}
 
 		use pallet_message_lane_rpc::{MessageLaneApi, MessageLaneRpcHandler};
+		use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
 		use sc_finality_grandpa_rpc::{GrandpaApi, GrandpaRpcHandler};
 		use sc_rpc::DenyUnsafe;
 		use substrate_frame_rpc_system::{FullSystem, SystemApi};
@@ -246,6 +247,9 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 				pool.clone(),
 				DenyUnsafe::No,
 			)));
+			io.extend_with(TransactionPaymentApi::to_delegate(TransactionPayment::new(
+				client.clone(),
+			)));
 			io.extend_with(GrandpaApi::to_delegate(GrandpaRpcHandler::new(
 				shared_authority_set.clone(),
 				shared_voter_state.clone(),
@@ -257,7 +261,6 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 				backend.clone(),
 				Arc::new(MillauMessageLaneKeys),
 			)));
-
 			io
 		})
 	};
@@ -275,6 +278,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		network_status_sinks,
 		system_rpc_tx,
 		config,
+		telemetry_span: None,
 	})?;
 
 	if role.is_authority() {
@@ -321,7 +325,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		name: Some(name),
 		observer_enabled: false,
 		keystore,
-		is_authority: role.is_network_authority(),
+		is_authority: role.is_authority(),
 	};
 
 	if enable_grandpa {
@@ -384,7 +388,7 @@ pub fn new_light(mut config: Configuration) -> Result<TaskManager, ServiceError>
 		Some(Box::new(grandpa_block_import)),
 		client.clone(),
 		InherentDataProviders::new(),
-		&task_manager.spawn_handle(),
+		&task_manager.spawn_essential_handle(),
 		config.prometheus_registry(),
 		sp_consensus::NeverCanAuthor,
 	)?;
@@ -423,6 +427,7 @@ pub fn new_light(mut config: Configuration) -> Result<TaskManager, ServiceError>
 		network,
 		network_status_sinks,
 		system_rpc_tx,
+		telemetry_span: None,
 	})?;
 
 	network_starter.start_network();

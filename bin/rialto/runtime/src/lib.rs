@@ -43,6 +43,7 @@ use crate::millau_messages::{ToMillauMessagePayload, WithMillauMessageBridge};
 use bridge_runtime_common::messages::{source::estimate_message_dispatch_and_delivery_fee, MessageBridge};
 use codec::Decode;
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList};
+use pallet_transaction_payment::{FeeDetails, RuntimeDispatchInfo};
 use sp_api::impl_runtime_apis;
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
@@ -69,6 +70,7 @@ pub use frame_system::Call as SystemCall;
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_bridge_currency_exchange::Call as BridgeCurrencyExchangeCall;
 pub use pallet_bridge_eth_poa::Call as BridgeEthPoACall;
+pub use pallet_finality_verifier::Call as FinalityBridgeMillauCall;
 pub use pallet_message_lane::Call as MessageLaneCall;
 pub use pallet_substrate_bridge::Call as BridgeMillauCall;
 pub use pallet_sudo::Call as SudoCall;
@@ -289,7 +291,7 @@ impl bp_currency_exchange::DepositInto for DepositInto {
 		// - deposited != 0: (should never happen in practice) deposit has been partially completed
 		match deposited_amount {
 			_ if deposited_amount == amount => {
-				frame_support::debug::trace!(
+				log::trace!(
 					target: "runtime",
 					"Deposited {} to {:?}",
 					amount,
@@ -299,7 +301,7 @@ impl bp_currency_exchange::DepositInto for DepositInto {
 				Ok(())
 			}
 			_ if deposited_amount == 0 => {
-				frame_support::debug::error!(
+				log::error!(
 					target: "runtime",
 					"Deposit of {} to {:?} has failed",
 					amount,
@@ -309,7 +311,7 @@ impl bp_currency_exchange::DepositInto for DepositInto {
 				Err(bp_currency_exchange::Error::DepositFailed)
 			}
 			_ => {
-				frame_support::debug::error!(
+				log::error!(
 					target: "runtime",
 					"Deposit of {} to {:?} has partially competed. {} has been deposited",
 					amount,
@@ -419,9 +421,6 @@ parameter_types! {
 
 impl pallet_finality_verifier::Config for Runtime {
 	type BridgedChain = bp_millau::Millau;
-	type HeaderChain = pallet_substrate_bridge::Module<Runtime>;
-	type AncestryProof = Vec<bp_millau::Header>;
-	type AncestryChecker = bp_header_chain::LinearAncestryChecker;
 	type MaxRequests = MaxRequests;
 }
 
@@ -534,7 +533,7 @@ impl_runtime_apis! {
 		}
 
 		fn execute_block(block: Block) {
-			Executive::execute_block(block)
+			Executive::execute_block(block);
 		}
 
 		fn initialize_block(header: &<Block as BlockT>::Header) {
@@ -569,7 +568,7 @@ impl_runtime_apis! {
 		}
 
 		fn random_seed() -> <Block as BlockT>::Hash {
-			RandomnessCollectiveFlip::random_seed()
+			RandomnessCollectiveFlip::random_seed().0.into()
 		}
 	}
 
@@ -642,6 +641,17 @@ impl_runtime_apis! {
 		}
 	}
 
+	impl bp_millau::MillauFinalityApi<Block> for Runtime {
+		fn best_finalized() -> (bp_millau::BlockNumber, bp_millau::Hash) {
+			let header = BridgeFinalityVerifier::best_finalized();
+			(header.number, header.hash())
+		}
+
+		fn is_known_header(hash: bp_millau::Hash) -> bool {
+			BridgeFinalityVerifier::is_known_header(hash)
+		}
+	}
+
 	impl bp_currency_exchange::RialtoCurrencyExchangeApi<Block, exchange::EthereumTransactionInclusionProof> for Runtime {
 		fn filter_transaction_proof(proof: exchange::EthereumTransactionInclusionProof) -> bool {
 			BridgeRialtoCurrencyExchange::filter_transaction_proof(&proof)
@@ -676,6 +686,18 @@ impl_runtime_apis! {
 
 		fn authorities() -> Vec<AuraId> {
 			Aura::authorities()
+		}
+	}
+
+	impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentApi<
+		Block,
+		Balance,
+	> for Runtime {
+		fn query_info(uxt: <Block as BlockT>::Extrinsic, len: u32) -> RuntimeDispatchInfo<Balance> {
+			TransactionPayment::query_info(uxt, len)
+		}
+		fn query_fee_details(uxt: <Block as BlockT>::Extrinsic, len: u32) -> FeeDetails<Balance> {
+			TransactionPayment::query_fee_details(uxt, len)
 		}
 	}
 
@@ -931,7 +953,7 @@ impl_runtime_apis! {
 						Default::default(),
 					);
 
-					prepare_message_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, _, _, _>(
+					prepare_message_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, (), _, _, _>(
 						params,
 						make_millau_message_key,
 						make_millau_outbound_lane_data_key,
@@ -964,7 +986,7 @@ impl_runtime_apis! {
 					};
 					use sp_runtime::traits::Header;
 
-					prepare_message_delivery_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, _, _>(
+					prepare_message_delivery_proof::<WithMillauMessageBridge, bp_millau::Hasher, Runtime, (), _, _>(
 						params,
 						|lane_id| pallet_message_lane::storage_keys::inbound_lane_data_key::<
 							Runtime,
@@ -1072,7 +1094,8 @@ mod tests {
 		type Weights = pallet_message_lane::weights::RialtoWeight<Runtime>;
 
 		pallet_message_lane::ensure_weights_are_correct::<Weights>(
-			bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_TX_WEIGHT,
+			bp_rialto::DEFAULT_MESSAGE_DELIVERY_TX_WEIGHT,
+			bp_rialto::ADDITIONAL_MESSAGE_BYTE_DELIVERY_WEIGHT,
 			bp_rialto::MAX_SINGLE_MESSAGE_DELIVERY_CONFIRMATION_TX_WEIGHT,
 		);
 
@@ -1083,11 +1106,6 @@ mod tests {
 			bp_rialto::max_extrinsic_size(),
 			bp_rialto::max_extrinsic_weight(),
 			max_incoming_message_proof_size,
-			bridge_runtime_common::messages::transaction_weight_without_multiplier(
-				bp_rialto::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
-				max_incoming_message_proof_size as _,
-				0,
-			),
 			messages::target::maximal_incoming_message_dispatch_weight(bp_rialto::max_extrinsic_weight()),
 		);
 
@@ -1102,11 +1120,6 @@ mod tests {
 			max_incoming_inbound_lane_data_proof_size,
 			bp_millau::MAX_UNREWARDED_RELAYER_ENTRIES_AT_INBOUND_LANE,
 			bp_millau::MAX_UNCONFIRMED_MESSAGES_AT_INBOUND_LANE,
-			bridge_runtime_common::messages::transaction_weight_without_multiplier(
-				bp_rialto::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
-				max_incoming_inbound_lane_data_proof_size as _,
-				0,
-			),
 		);
 	}
 

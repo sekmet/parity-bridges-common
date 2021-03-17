@@ -1,16 +1,18 @@
 [workspace]
 
 members = [
-	"bin/millau/node",
-	"bin/rialto/node",
-	"bin/millau/runtime",
-	"bin/rialto/runtime",
-	"modules/call-dispatch",
-	"modules/substrate",
-	"modules/ethereum",
-	"modules/ethereum-contract/builtin",
-	"modules/finality-verifier",
-	"modules/currency-exchange",
-	"relays/ethereum",
-	"relays/substrate",
+	"bin/*/node",
+	"bin/*/runtime",
+	"fuzz/*",
+	"modules/*",
+	"primitives/*",
+	"primitives/chains/*",
+	"relays/*",
+	"relays/clients/*",
+	"relays/generic/*",
+]
+exclude = [
+	"primitives/chains",
+	"relays/clients",
+	"relays/generic"
 ]

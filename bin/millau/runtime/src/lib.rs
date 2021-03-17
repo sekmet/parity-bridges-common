@@ -37,6 +37,7 @@ use crate::rialto_messages::{ToRialtoMessagePayload, WithRialtoMessageBridge};
 use bridge_runtime_common::messages::{source::estimate_message_dispatch_and_delivery_fee, MessageBridge};
 use codec::Decode;
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList};
+use pallet_transaction_payment::{FeeDetails, RuntimeDispatchInfo};
 use sp_api::impl_runtime_apis;
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
@@ -61,6 +62,8 @@ pub use frame_support::{
 
 pub use frame_system::Call as SystemCall;
 pub use pallet_balances::Call as BalancesCall;
+pub use pallet_finality_verifier::Call as FinalityBridgeRialtoCall;
+pub use pallet_finality_verifier::Call as FinalityBridgeWestendCall;
 pub use pallet_message_lane::Call as MessageLaneCall;
 pub use pallet_substrate_bridge::Call as BridgeRialtoCall;
 pub use pallet_sudo::Call as SudoCall;
@@ -310,11 +313,15 @@ parameter_types! {
 	pub const MaxRequests: u32 = 50;
 }
 
+pub type RialtoFinalityVerifierInstance = ();
 impl pallet_finality_verifier::Config for Runtime {
 	type BridgedChain = bp_rialto::Rialto;
-	type HeaderChain = pallet_substrate_bridge::Module<Runtime>;
-	type AncestryProof = Vec<bp_rialto::Header>;
-	type AncestryChecker = bp_header_chain::LinearAncestryChecker;
+	type MaxRequests = MaxRequests;
+}
+
+pub type WestendFinalityVerifierInstance = pallet_finality_verifier::Instance1;
+impl pallet_finality_verifier::Config<WestendFinalityVerifierInstance> for Runtime {
+	type BridgedChain = bp_westend::Westend;
 	type MaxRequests = MaxRequests;
 }
 
@@ -372,7 +379,8 @@ construct_runtime!(
 		BridgeRialto: pallet_substrate_bridge::{Module, Call, Storage, Config<T>},
 		BridgeRialtoMessageLane: pallet_message_lane::{Module, Call, Storage, Event<T>},
 		BridgeCallDispatch: pallet_bridge_call_dispatch::{Module, Event<T>},
-		BridgeFinalityVerifier: pallet_finality_verifier::{Module, Call},
+		BridgeRialtoFinalityVerifier: pallet_finality_verifier::{Module, Call},
+		BridgeWestendFinalityVerifier: pallet_finality_verifier::<Instance1>::{Module, Call},
 		System: frame_system::{Module, Call, Config, Storage, Event<T>},
 		RandomnessCollectiveFlip: pallet_randomness_collective_flip::{Module, Call, Storage},
 		Timestamp: pallet_timestamp::{Module, Call, Storage, Inherent},
@@ -423,7 +431,7 @@ impl_runtime_apis! {
 		}
 
 		fn execute_block(block: Block) {
-			Executive::execute_block(block)
+			Executive::execute_block(block);
 		}
 
 		fn initialize_block(header: &<Block as BlockT>::Header) {
@@ -458,7 +466,7 @@ impl_runtime_apis! {
 		}
 
 		fn random_seed() -> <Block as BlockT>::Hash {
-			RandomnessCollectiveFlip::random_seed()
+			RandomnessCollectiveFlip::random_seed().0.into()
 		}
 	}
 
@@ -490,6 +498,18 @@ impl_runtime_apis! {
 
 		fn authorities() -> Vec<AuraId> {
 			Aura::authorities()
+		}
+	}
+
+	impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentApi<
+		Block,
+		Balance,
+	> for Runtime {
+		fn query_info(uxt: <Block as BlockT>::Extrinsic, len: u32) -> RuntimeDispatchInfo<Balance> {
+			TransactionPayment::query_info(uxt, len)
+		}
+		fn query_fee_details(uxt: <Block as BlockT>::Extrinsic, len: u32) -> FeeDetails<Balance> {
+			TransactionPayment::query_fee_details(uxt, len)
 		}
 	}
 
@@ -556,6 +576,28 @@ impl_runtime_apis! {
 
 		fn is_finalized_block(hash: bp_rialto::Hash) -> bool {
 			BridgeRialto::is_finalized_header(hash)
+		}
+	}
+
+	impl bp_rialto::RialtoFinalityApi<Block> for Runtime {
+		fn best_finalized() -> (bp_rialto::BlockNumber, bp_rialto::Hash) {
+			let header = BridgeRialtoFinalityVerifier::best_finalized();
+			(header.number, header.hash())
+		}
+
+		fn is_known_header(hash: bp_rialto::Hash) -> bool {
+			BridgeRialtoFinalityVerifier::is_known_header(hash)
+		}
+	}
+
+	impl bp_westend::WestendFinalityApi<Block> for Runtime {
+		fn best_finalized() -> (bp_westend::BlockNumber, bp_westend::Hash) {
+			let header = BridgeWestendFinalityVerifier::best_finalized();
+			(header.number, header.hash())
+		}
+
+		fn is_known_header(hash: bp_westend::Hash) -> bool {
+			BridgeWestendFinalityVerifier::is_known_header(hash)
 		}
 	}
 
@@ -643,7 +685,8 @@ mod tests {
 		type Weights = pallet_message_lane::weights::RialtoWeight<Runtime>;
 
 		pallet_message_lane::ensure_weights_are_correct::<Weights>(
-			bp_millau::MAX_SINGLE_MESSAGE_DELIVERY_TX_WEIGHT,
+			bp_millau::DEFAULT_MESSAGE_DELIVERY_TX_WEIGHT,
+			bp_millau::ADDITIONAL_MESSAGE_BYTE_DELIVERY_WEIGHT,
 			bp_millau::MAX_SINGLE_MESSAGE_DELIVERY_CONFIRMATION_TX_WEIGHT,
 		);
 
@@ -654,11 +697,6 @@ mod tests {
 			bp_millau::max_extrinsic_size(),
 			bp_millau::max_extrinsic_weight(),
 			max_incoming_message_proof_size,
-			bridge_runtime_common::messages::transaction_weight_without_multiplier(
-				bp_millau::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
-				max_incoming_message_proof_size as _,
-				0,
-			),
 			messages::target::maximal_incoming_message_dispatch_weight(bp_millau::max_extrinsic_weight()),
 		);
 
@@ -673,11 +711,6 @@ mod tests {
 			max_incoming_inbound_lane_data_proof_size,
 			bp_rialto::MAX_UNREWARDED_RELAYER_ENTRIES_AT_INBOUND_LANE,
 			bp_rialto::MAX_UNCONFIRMED_MESSAGES_AT_INBOUND_LANE,
-			bridge_runtime_common::messages::transaction_weight_without_multiplier(
-				bp_millau::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic,
-				max_incoming_inbound_lane_data_proof_size as _,
-				0,
-			),
 		);
 	}
 }

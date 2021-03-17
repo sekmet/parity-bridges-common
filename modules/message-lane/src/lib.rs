@@ -255,33 +255,28 @@ decl_module! {
 			match new_owner {
 				Some(new_owner) => {
 					ModuleOwner::<T, I>::put(&new_owner);
-					frame_support::debug::info!("Setting pallet Owner to: {:?}", new_owner);
+					log::info!("Setting pallet Owner to: {:?}", new_owner);
 				},
 				None => {
 					ModuleOwner::<T, I>::kill();
-					frame_support::debug::info!("Removed Owner of pallet.");
+					log::info!("Removed Owner of pallet.");
 				},
 			}
 		}
 
-		/// Halt all pallet operations. Operations may be resumed using `resume_operations` call.
+		/// Halt or resume all pallet operations.
 		///
 		/// May only be called either by root, or by `ModuleOwner`.
 		#[weight = (T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational)]
-		pub fn halt_operations(origin) {
+		pub fn set_operational(origin, operational: bool) {
 			ensure_owner_or_root::<T, I>(origin)?;
-			IsHalted::<I>::put(true);
-			frame_support::debug::warn!("Stopping pallet operations.");
-		}
+			<IsHalted<I>>::put(operational);
 
-		/// Resume all pallet operations. May be called even if pallet is halted.
-		///
-		/// May only be called either by root, or by `ModuleOwner`.
-		#[weight = (T::DbWeight::get().reads_writes(1, 1), DispatchClass::Operational)]
-		pub fn resume_operations(origin) {
-			ensure_owner_or_root::<T, I>(origin)?;
-			IsHalted::<I>::put(false);
-			frame_support::debug::info!("Resuming pallet operations.");
+			if operational {
+				log::info!("Resuming pallet operations.");
+			} else {
+				log::warn!("Stopping pallet operations.");
+			}
 		}
 
 		/// Update pallet parameter.
@@ -310,7 +305,7 @@ decl_module! {
 			// let's first check if message can be delivered to target chain
 			T::TargetHeaderChain::verify_message(&payload)
 				.map_err(|err| {
-					frame_support::debug::trace!(
+					log::trace!(
 						"Message to lane {:?} is rejected by target chain: {:?}",
 						lane_id,
 						err,
@@ -328,7 +323,7 @@ decl_module! {
 				&lane.data(),
 				&payload,
 			).map_err(|err| {
-				frame_support::debug::trace!(
+				log::trace!(
 					"Message to lane {:?} is rejected by lane verifier: {:?}",
 					lane_id,
 					err,
@@ -343,7 +338,7 @@ decl_module! {
 				&delivery_and_dispatch_fee,
 				&Self::relayer_fund_account_id(),
 			).map_err(|err| {
-				frame_support::debug::trace!(
+				log::trace!(
 					"Message to lane {:?} is rejected because submitter {:?} is unable to pay fee {:?}: {:?}",
 					lane_id,
 					submitter,
@@ -363,7 +358,7 @@ decl_module! {
 			});
 			lane.prune_messages(T::MaxMessagesToPruneAtOnce::get());
 
-			frame_support::debug::trace!(
+			log::trace!(
 				"Accepted message {} to lane {:?}. Message size: {:?}",
 				nonce,
 				lane_id,
@@ -399,7 +394,7 @@ decl_module! {
 				&additional_fee,
 				&Self::relayer_fund_account_id(),
 			).map_err(|err| {
-				frame_support::debug::trace!(
+				log::trace!(
 					"Submitter {:?} can't pay additional fee {:?} for the message {:?}/{:?}: {:?}",
 					submitter,
 					additional_fee,
@@ -455,7 +450,7 @@ decl_module! {
 				T::InboundPayload,
 			>(proof, messages_count)
 				.map_err(|err| {
-					frame_support::debug::trace!(
+					log::trace!(
 						"Rejecting invalid messages proof: {:?}",
 						err,
 					);
@@ -474,7 +469,7 @@ decl_module! {
 				)
 				.fold(0, |sum, weight| sum.saturating_add(weight));
 			if dispatch_weight < actual_dispatch_weight {
-				frame_support::debug::trace!(
+				log::trace!(
 					"Rejecting messages proof because of dispatch weight mismatch: declared={}, expected={}",
 					dispatch_weight,
 					actual_dispatch_weight,
@@ -492,7 +487,7 @@ decl_module! {
 				if let Some(lane_state) = lane_data.lane_state {
 					let updated_latest_confirmed_nonce = lane.receive_state_update(lane_state);
 					if let Some(updated_latest_confirmed_nonce) = updated_latest_confirmed_nonce {
-						frame_support::debug::trace!(
+						log::trace!(
 							"Received lane {:?} state update: latest_confirmed_nonce={}",
 							lane_id,
 							updated_latest_confirmed_nonce,
@@ -510,7 +505,7 @@ decl_module! {
 				}
 			}
 
-			frame_support::debug::trace!(
+			log::trace!(
 				"Received messages: total={}, valid={}",
 				total_messages,
 				valid_messages,
@@ -530,7 +525,7 @@ decl_module! {
 
 			let confirmation_relayer = ensure_signed(origin)?;
 			let (lane_id, lane_data) = T::TargetHeaderChain::verify_messages_delivery_proof(proof).map_err(|err| {
-				frame_support::debug::trace!(
+				log::trace!(
 					"Rejecting invalid messages delivery proof: {:?}",
 					err,
 				);
@@ -585,7 +580,7 @@ decl_module! {
 				);
 			}
 
-			frame_support::debug::trace!(
+			log::trace!(
 				"Received messages delivery proof up to (and including) {} at lane {:?}",
 				last_delivered_nonce,
 				lane_id,
@@ -915,29 +910,29 @@ mod tests {
 
 			assert_ok!(Module::<TestRuntime>::set_owner(Origin::root(), Some(1)));
 			assert_noop!(
-				Module::<TestRuntime>::halt_operations(Origin::signed(2)),
+				Module::<TestRuntime>::set_operational(Origin::signed(2), false),
 				DispatchError::BadOrigin,
 			);
-			assert_ok!(Module::<TestRuntime>::halt_operations(Origin::root()));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::root(), false));
 
 			assert_ok!(Module::<TestRuntime>::set_owner(Origin::signed(1), None));
 			assert_noop!(
-				Module::<TestRuntime>::resume_operations(Origin::signed(1)),
+				Module::<TestRuntime>::set_operational(Origin::signed(1), true),
 				DispatchError::BadOrigin,
 			);
 			assert_noop!(
-				Module::<TestRuntime>::resume_operations(Origin::signed(2)),
+				Module::<TestRuntime>::set_operational(Origin::signed(2), true),
 				DispatchError::BadOrigin,
 			);
-			assert_ok!(Module::<TestRuntime>::resume_operations(Origin::root()));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::root(), true));
 		});
 	}
 
 	#[test]
 	fn pallet_may_be_halted_by_root() {
 		run_test(|| {
-			assert_ok!(Module::<TestRuntime>::halt_operations(Origin::root()));
-			assert_ok!(Module::<TestRuntime>::resume_operations(Origin::root()));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::root(), false));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::root(), true));
 		});
 	}
 
@@ -946,21 +941,21 @@ mod tests {
 		run_test(|| {
 			ModuleOwner::<TestRuntime>::put(2);
 
-			assert_ok!(Module::<TestRuntime>::halt_operations(Origin::signed(2)));
-			assert_ok!(Module::<TestRuntime>::resume_operations(Origin::signed(2)));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::signed(2), false));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::signed(2), true));
 
 			assert_noop!(
-				Module::<TestRuntime>::halt_operations(Origin::signed(1)),
+				Module::<TestRuntime>::set_operational(Origin::signed(1), false),
 				DispatchError::BadOrigin,
 			);
 			assert_noop!(
-				Module::<TestRuntime>::resume_operations(Origin::signed(1)),
+				Module::<TestRuntime>::set_operational(Origin::signed(1), true),
 				DispatchError::BadOrigin,
 			);
 
-			assert_ok!(Module::<TestRuntime>::halt_operations(Origin::signed(2)));
+			assert_ok!(Module::<TestRuntime>::set_operational(Origin::signed(2), false));
 			assert_noop!(
-				Module::<TestRuntime>::resume_operations(Origin::signed(1)),
+				Module::<TestRuntime>::set_operational(Origin::signed(1), true),
 				DispatchError::BadOrigin,
 			);
 		});

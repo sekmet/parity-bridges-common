@@ -46,10 +46,7 @@ use sp_trie::StorageProof;
 // Re-export since the node uses these when configuring genesis
 pub use storage::{InitializationData, ScheduledChange};
 
-pub use storage_proof::StorageProofChecker;
-
 mod storage;
-mod storage_proof;
 mod verifier;
 
 #[cfg(test)]
@@ -155,6 +152,11 @@ decl_error! {
 		AlreadyInitialized,
 		/// The given header is not a descendant of a particular header.
 		NotDescendant,
+		/// The header being imported is on a fork which is incompatible with the current chain.
+		///
+		/// This can happen if we try and import a finalized header at a lower height than our
+		/// current `best_finalized` header.
+		ConflictingFork,
 	}
 }
 
@@ -176,7 +178,7 @@ decl_module! {
 			ensure_operational::<T>()?;
 			let _ = ensure_signed(origin)?;
 			let hash = header.hash();
-			frame_support::debug::trace!("Going to import header {:?}: {:?}", hash, header);
+			log::trace!("Going to import header {:?}: {:?}", hash, header);
 
 			let mut verifier = verifier::Verifier {
 				storage: PalletStorage::<T>::new(),
@@ -185,11 +187,11 @@ decl_module! {
 			let _ = verifier
 				.import_header(hash, header)
 				.map_err(|e| {
-					frame_support::debug::error!("Failed to import header {:?}: {:?}", hash, e);
+					log::error!("Failed to import header {:?}: {:?}", hash, e);
 					<Error<T>>::InvalidHeader
 				})?;
 
-			frame_support::debug::trace!("Successfully imported header: {:?}", hash);
+			log::trace!("Successfully imported header: {:?}", hash);
 
 			Ok(())
 		}
@@ -208,7 +210,7 @@ decl_module! {
 		) -> DispatchResult {
 			ensure_operational::<T>()?;
 			let _ = ensure_signed(origin)?;
-			frame_support::debug::trace!("Going to finalize header: {:?}", hash);
+			log::trace!("Going to finalize header: {:?}", hash);
 
 			let mut verifier = verifier::Verifier {
 				storage: PalletStorage::<T>::new(),
@@ -217,11 +219,11 @@ decl_module! {
 			let _ = verifier
 				.import_finality_proof(hash, finality_proof.into())
 				.map_err(|e| {
-					frame_support::debug::error!("Failed to finalize header {:?}: {:?}", hash, e);
+					log::error!("Failed to finalize header {:?}: {:?}", hash, e);
 					<Error<T>>::UnfinalizedHeader
 				})?;
 
-			frame_support::debug::trace!("Successfully finalized header: {:?}", hash);
+			log::trace!("Successfully finalized header: {:?}", hash);
 
 			Ok(())
 		}
@@ -246,7 +248,7 @@ decl_module! {
 			ensure!(init_allowed, <Error<T>>::AlreadyInitialized);
 			initialize_bridge::<T>(init_data.clone());
 
-			frame_support::debug::info!(
+			log::info!(
 				"Pallet has been initialized with the following parameters: {:?}", init_data
 			);
 		}
@@ -260,11 +262,11 @@ decl_module! {
 			match new_owner {
 				Some(new_owner) => {
 					ModuleOwner::<T>::put(&new_owner);
-					frame_support::debug::info!("Setting pallet Owner to: {:?}", new_owner);
+					log::info!("Setting pallet Owner to: {:?}", new_owner);
 				},
 				None => {
 					ModuleOwner::<T>::kill();
-					frame_support::debug::info!("Removed Owner of pallet.");
+					log::info!("Removed Owner of pallet.");
 				},
 			}
 		}
@@ -276,7 +278,7 @@ decl_module! {
 		pub fn halt_operations(origin) {
 			ensure_owner_or_root::<T>(origin)?;
 			IsHalted::put(true);
-			frame_support::debug::warn!("Stopping pallet operations.");
+			log::warn!("Stopping pallet operations.");
 		}
 
 		/// Resume all pallet operations. May be called even if pallet is halted.
@@ -286,7 +288,7 @@ decl_module! {
 		pub fn resume_operations(origin) {
 			ensure_owner_or_root::<T>(origin)?;
 			IsHalted::put(false);
-			frame_support::debug::info!("Resuming pallet operations.");
+			log::info!("Resuming pallet operations.");
 		}
 	}
 }
@@ -350,7 +352,7 @@ impl<T: Config> Module<T> {
 	pub fn parse_finalized_storage_proof<R>(
 		finalized_header_hash: BridgedBlockHash<T>,
 		storage_proof: StorageProof,
-		parse: impl FnOnce(StorageProofChecker<BridgedBlockHasher<T>>) -> R,
+		parse: impl FnOnce(bp_runtime::StorageProofChecker<BridgedBlockHasher<T>>) -> R,
 	) -> Result<R, sp_runtime::DispatchError> {
 		let storage = PalletStorage::<T>::new();
 		let header = storage
@@ -360,8 +362,8 @@ impl<T: Config> Module<T> {
 			return Err(Error::<T>::UnfinalizedHeader.into());
 		}
 
-		let storage_proof_checker =
-			StorageProofChecker::new(*header.state_root(), storage_proof).map_err(Error::<T>::from)?;
+		let storage_proof_checker = bp_runtime::StorageProofChecker::new(*header.state_root(), storage_proof)
+			.map_err(|_| Error::<T>::StorageRootMismatch)?;
 		Ok(parse(storage_proof_checker))
 	}
 }
@@ -375,8 +377,14 @@ impl<T: Config> bp_header_chain::HeaderChain<BridgedHeader<T>, sp_runtime::Dispa
 		PalletStorage::<T>::new().current_authority_set()
 	}
 
-	fn append_header(header: BridgedHeader<T>) {
+	fn append_header(header: BridgedHeader<T>) -> Result<(), sp_runtime::DispatchError> {
+		// We do a quick check here to ensure that our header chain is making progress and isn't
+		// "travelling back in time" (which would be indicative of something bad, e.g a hard-fork).
+		let best_finalized = PalletStorage::<T>::new().best_finalized_header().header;
+		ensure!(best_finalized.number() < header.number(), <Error<T>>::ConflictingFork);
 		import_header_unchecked::<_, T>(&mut PalletStorage::<T>::new(), header);
+
+		Ok(())
 	}
 }
 
@@ -406,7 +414,7 @@ where
 	} else {
 		// We don't have a scheduled change in storage at the moment. Let's check if the current
 		// header signals an authority set change.
-		if let Some(change) = verifier::find_scheduled_change(&header) {
+		if let Some(change) = bp_header_chain::find_grandpa_authorities_scheduled_change(&header) {
 			let next_set = AuthoritySet {
 				authorities: change.next_authorities,
 				set_id: storage.current_authority_set().set_id + 1,
@@ -714,7 +722,7 @@ mod tests {
 	use crate::mock::{run_test, test_header, unfinalized_header, Origin, TestHeader, TestRuntime};
 	use bp_header_chain::HeaderChain;
 	use bp_test_utils::{alice, authority_list, bob};
-	use frame_support::{assert_noop, assert_ok};
+	use frame_support::{assert_err, assert_noop, assert_ok};
 	use sp_runtime::DispatchError;
 
 	fn init_with_origin(origin: Origin) -> Result<InitializationData<TestHeader>, DispatchError> {
@@ -887,7 +895,7 @@ mod tests {
 	fn parse_finalized_storage_accepts_valid_proof() {
 		run_test(|| {
 			let mut storage = PalletStorage::<TestRuntime>::new();
-			let (state_root, storage_proof) = storage_proof::tests::craft_valid_storage_proof();
+			let (state_root, storage_proof) = bp_runtime::craft_valid_storage_proof();
 			let mut header = unfinalized_header(1);
 			header.is_finalized = true;
 			header.header.set_state_root(state_root);
@@ -907,11 +915,30 @@ mod tests {
 			let storage = PalletStorage::<TestRuntime>::new();
 
 			let header = test_header(2);
-			Module::<TestRuntime>::append_header(header.clone());
+			assert_ok!(Module::<TestRuntime>::append_header(header.clone()));
 
 			assert!(storage.header_by_hash(header.hash()).unwrap().is_finalized);
 			assert_eq!(storage.best_finalized_header().header, header);
 			assert_eq!(storage.best_headers()[0].hash, header.hash());
+		})
+	}
+
+	#[test]
+	fn importing_unchecked_header_ensures_that_chain_is_extended() {
+		run_test(|| {
+			init_with_origin(Origin::root()).unwrap();
+
+			let header = test_header(3);
+			assert_ok!(Module::<TestRuntime>::append_header(header));
+
+			let header = test_header(2);
+			assert_err!(
+				Module::<TestRuntime>::append_header(header),
+				Error::<TestRuntime>::ConflictingFork,
+			);
+
+			let header = test_header(4);
+			assert_ok!(Module::<TestRuntime>::append_header(header));
 		})
 	}
 
@@ -930,7 +957,7 @@ mod tests {
 			header.digest = fork_tests::change_log(0);
 
 			// Let's import our test header
-			Module::<TestRuntime>::append_header(header.clone());
+			assert_ok!(Module::<TestRuntime>::append_header(header.clone()));
 
 			// Make sure that our header is the best finalized
 			assert_eq!(storage.best_finalized_header().header, header);
@@ -960,8 +987,8 @@ mod tests {
 			let header = test_header(3);
 
 			// Let's import our test headers
-			Module::<TestRuntime>::append_header(schedules_change);
-			Module::<TestRuntime>::append_header(header.clone());
+			assert_ok!(Module::<TestRuntime>::append_header(schedules_change));
+			assert_ok!(Module::<TestRuntime>::append_header(header.clone()));
 
 			// Make sure that our header is the best finalized
 			assert_eq!(storage.best_finalized_header().header, header);
@@ -1001,7 +1028,7 @@ mod tests {
 
 			// We are expecting an authority set change at height 2, so this header should enact
 			// that upon being imported.
-			Module::<TestRuntime>::append_header(test_header(2));
+			assert_ok!(Module::<TestRuntime>::append_header(test_header(2)));
 
 			// Make sure that the authority set actually changed upon importing our header
 			assert_eq!(
